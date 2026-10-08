@@ -32,14 +32,10 @@ class Settings(BaseSettings):
     EMBEDDING_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     EMBEDDING_MODEL: str = "text-embedding-v3"
 
-    MCP_SANDBOX_URL: str = "http://localhost:3000"
-    MCP_LEETCODE_URL: str = "http://localhost:3001"
-    MCP_GITHUB_URL: str = "http://localhost:3002"
+    # MCP 工具服务（自建 Tool Server，stdio 协议）
     MCP_ENABLED: bool = False
-
-    CAREER_MCP_JOB_URL: str = "http://localhost:3003"
-    CAREER_MCP_RESUME_URL: str = "http://localhost:3004"
-    CAREER_MCP_INTERVIEW_URL: str = "http://localhost:3005"
+    MCP_STDIO_SERVER_CMD: str = "python -m companion_ai.tools.mcp_server"
+    # CareerAgent 工具描述开关（工具实际链路由 MCP_ENABLED 控制）
     CAREER_MCP_ENABLED: bool = False
 
     SENTIMENT_MODEL_NAME: str = "distilbert-base-uncased-finetuned-sst-2-english"
@@ -53,6 +49,23 @@ class Settings(BaseSettings):
     LOG_DIR: str = "./logs"
 
     DEFAULT_USER_ID: str = "default_user"
+
+    # LangGraph 检查点持久化（面试会话跨进程重启恢复）
+    CHECKPOINT_DB_PATH: str = "./checkpoints.db"
+
+    # GuardAgent 置信度分级仲裁
+    GUARD_LLM_ARBITRATION: bool = True          # 低置信度时启用 LLM few-shot 仲裁
+    GUARD_ARBITRATION_THRESHOLD: float = 0.6    # 低于该置信度触发 LLM 仲裁
+
+    # 记忆提取与反思
+    MEMORY_FACT_EXTRACTION: bool = True         # 对话后抽取结构化用户事实
+    MEMORY_FACT_BOOST: float = 1.3              # 事实记忆在检索打分中的加成系数
+    MEMORY_REFLECTION_INTERVAL: int = 15        # 每 N 次对话触发一次画像反思
+
+    # 循环面试对话图
+    INTERVIEW_GRAPH_ENABLED: bool = True        # 启用面试状态机图（False 时降级旧版 CareerAgent 面试模式）
+    INTERVIEW_MAX_QUESTIONS: int = 3            # 每场面试的题目数上限
+    INTERVIEW_PROBE_SCORE_THRESHOLD: int = 60   # 回答得分低于该阈值时触发动态追问
 
     class Config:
         env_file = ".env"

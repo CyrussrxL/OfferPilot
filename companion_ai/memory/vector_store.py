@@ -43,6 +43,18 @@ class OpenAICompatibleEmbeddingFunction:
     def __call__(self, input: List[str]) -> List[List[float]]:
         return self._embedding_function(input)
 
+    def embed_documents(self, input) -> List[List[float]]:
+        """ChromaDB add 路径（chromadb 1.x 以 input= 传参）。"""
+        return self._embedding_function.embed_documents(input)
+
+    def embed_query(self, input) -> List[float]:
+        """ChromaDB query 路径（input 可为 str 或 List[str]）。"""
+        return self._embedding_function.embed_query(input)
+
+    def name(self) -> str:
+        """ChromaDB >=0.5 需要 EF 提供 name()，委托给底层实现。"""
+        return self._embedding_function.name()
+
 
 def create_embedding_function():
     """
@@ -72,11 +84,25 @@ class SimpleEmbeddingFunction:
     """
     def __init__(self):
         pass
-    
+
     def __call__(self, input):
         import numpy as np
         return [np.random.rand(384).tolist() for _ in input]
-    
+
+    def embed_documents(self, input) -> List[List[float]]:
+        """ChromaDB add 路径。"""
+        return self(input)
+
+    def embed_query(self, input) -> List[List[float]]:
+        """ChromaDB query 路径。
+
+        chromadb 1.5 以 input=[text] 调用并期望返回 [embedding]
+        （单元素嵌入列表），缺失此方法或返回单个向量都会导致
+        本地降级模式检索静默失败。
+        """
+        texts = input if isinstance(input, list) else [input]
+        return self(texts)
+
     @staticmethod
     def name():
         return "simple_local_embedding"
@@ -142,16 +168,19 @@ class VectorStore:
         try:
             with open(seeds_file, "r", encoding="utf-8") as f:
                 seeds = json.load(f)
-            
+
             texts = [seed["text"] for seed in seeds]
             metadatas = [{"category": seed["category"]} for seed in seeds]
             ids = [f"seed_{i}" for i in range(len(seeds))]
-            
-            self.classification_collection.add(
-                documents=texts,
-                metadatas=metadatas,
-                ids=ids,
-            )
+
+            # DashScope Embedding API 限制单次批量 <= 10 条，分批插入
+            batch_size = 10
+            for i in range(0, len(texts), batch_size):
+                self.classification_collection.add(
+                    documents=texts[i : i + batch_size],
+                    metadatas=metadatas[i : i + batch_size],
+                    ids=ids[i : i + batch_size],
+                )
             logger.info(f"分类种子数据初始化完成，共 {len(seeds)} 条")
         except Exception as e:
             logger.error(f"加载分类种子数据失败: {e}")
@@ -164,6 +193,7 @@ class VectorStore:
         category: str,
         timestamp: str,
         role: str = "user",
+        memory_type: str = "episode",
     ) -> None:
         """
         存储一条对话记录到向量库。
@@ -175,6 +205,7 @@ class VectorStore:
             category: 消息类别（coding/career/emotional/chitchat）
             timestamp: 时间戳
             role: 角色（user/assistant）
+            memory_type: 记忆类型（episode=原始对话 / fact=提取的结构化事实）
         """
         doc_id = f"{user_id}_{role}_{uuid.uuid4().hex[:8]}"
         metadata = {
@@ -183,6 +214,7 @@ class VectorStore:
             "category": category,
             "timestamp": timestamp,
             "role": role,
+            "memory_type": memory_type,
             "retrieval_count": "0",  # 初始检索次数为 0
         }
         try:
@@ -191,9 +223,189 @@ class VectorStore:
                 metadatas=[metadata],
                 ids=[doc_id],
             )
-            logger.info(f"对话已存储: user={user_id}, category={category}, emotion={emotion}")
+            logger.info(
+                f"对话已存储: user={user_id}, category={category}, "
+                f"emotion={emotion}, memory_type={memory_type}"
+            )
         except Exception as e:
             logger.error(f"存储对话失败: {e}")
+
+    def store_fact(self, user_id: str, fact: str, timestamp: str) -> None:
+        """
+        存储一条从对话中提取的结构化用户事实（高权重记忆）。
+
+        事实记忆与原始对话共用 conversations collection，
+        通过 memory_type="fact" 区分，检索时享受加成系数。
+
+        Args:
+            user_id: 用户唯一标识
+            fact: 事实文本（如"用户目标岗位是字节后端"）
+            timestamp: 时间戳
+        """
+        self.store_conversation(
+            user_id=user_id,
+            text=fact,
+            emotion="neutral",
+            category="fact",
+            timestamp=timestamp,
+            role="user",
+            memory_type="fact",
+        )
+
+    def retrieve_facts(
+        self, user_id: str, query: str, top_k: int = 2
+    ) -> List[Dict[str, Any]]:
+        """
+        事实记忆检索路径：只检索 memory_type="fact" 的记忆。
+
+        与 retrieve_memories（原文路径）配合，实现"事实 + 原文"双路召回。
+
+        Args:
+            user_id: 用户唯一标识
+            query: 查询文本
+            top_k: 返回的最大事实条数
+
+        Returns:
+            事实记忆列表（含 type="fact" 标记）
+        """
+        try:
+            results = self.conversation_collection.query(
+                query_texts=[query],
+                n_results=top_k * 3,
+                where={"$and": [{"user_id": user_id}, {"memory_type": "fact"}]},
+            )
+
+            facts = []
+            if results and results["documents"] and results["documents"][0]:
+                for doc, meta, distance in zip(
+                    results["documents"][0],
+                    results["metadatas"][0],
+                    results["distances"][0],
+                ):
+                    similarity = 1.0 / (1.0 + distance)
+                    memory = {
+                        "text": doc,
+                        "emotion": meta.get("emotion", "neutral"),
+                        "timestamp": meta.get("timestamp", ""),
+                        "category": meta.get("category", "fact"),
+                        "role": meta.get("role", "user"),
+                        "memory_type": "fact",
+                        "similarity": round(similarity, 4),
+                        "retrieval_count": int(meta.get("retrieval_count", "0")),
+                    }
+                    memory["final_score"] = self._calculate_memory_weight(memory)
+                    facts.append(memory)
+                    if len(facts) >= top_k:
+                        break
+
+            facts.sort(key=lambda x: x["final_score"], reverse=True)
+            return facts
+        except Exception as e:
+            logger.error(f"事实记忆检索失败: {e}")
+            return []
+
+    def get_all_facts(self, user_id: str, limit: int = 50) -> List[str]:
+        """
+        获取用户全部事实记忆（供周期性反思使用）。
+
+        Args:
+            user_id: 用户唯一标识
+            limit: 最大返回条数
+
+        Returns:
+            事实文本列表
+        """
+        try:
+            results = self.conversation_collection.get(
+                where={"$and": [{"user_id": user_id}, {"memory_type": "fact"}]},
+                limit=limit,
+            )
+            if results and results["documents"]:
+                return list(results["documents"])
+            return []
+        except Exception as e:
+            logger.error(f"获取事实记忆失败: {e}")
+            return []
+
+    def get_facts_with_metadata(self, user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        获取用户全部事实记忆（含 id / timestamp，供记忆管理面板使用）。
+
+        与 get_all_facts 的区别：返回记录 id，用于删除/纠正时精确定位。
+
+        Args:
+            user_id: 用户唯一标识
+            limit: 最大返回条数
+
+        Returns:
+            [{"id", "text", "timestamp"}] 列表
+        """
+        try:
+            results = self.conversation_collection.get(
+                where={"$and": [{"user_id": user_id}, {"memory_type": "fact"}]},
+                limit=limit,
+            )
+            facts = []
+            if results and results["documents"]:
+                for doc_id, doc, meta in zip(
+                    results["ids"], results["documents"], results["metadatas"]
+                ):
+                    facts.append(
+                        {
+                            "id": doc_id,
+                            "text": doc,
+                            "timestamp": meta.get("timestamp", ""),
+                        }
+                    )
+            return facts
+        except Exception as e:
+            logger.error(f"获取事实记忆（含元数据）失败: {e}")
+            return []
+
+    def delete_fact(self, fact_id: str) -> Dict[str, Any]:
+        """
+        删除一条事实记忆（用户可控记忆：删除错误/过时事实）。
+
+        Args:
+            fact_id: 事实记录 id（来自 get_facts_with_metadata）
+
+        Returns:
+            {"success": bool, "message": str}
+        """
+        try:
+            self.conversation_collection.delete(ids=[fact_id])
+            logger.info(f"事实记忆已删除: {fact_id}")
+            return {"success": True, "message": "事实已删除"}
+        except Exception as e:
+            logger.error(f"删除事实记忆失败: {e}")
+            return {"success": False, "message": str(e)}
+
+    def update_fact(self, fact_id: str, new_text: str) -> Dict[str, Any]:
+        """
+        纠正一条事实记忆（用户可控记忆：修正 AI 记错的表述）。
+
+        直接更新对应记录的文本，时间戳与元数据保持不变。
+
+        Args:
+            fact_id: 事实记录 id
+            new_text: 纠正后的事实文本
+
+        Returns:
+            {"success": bool, "message": str}
+        """
+        if not new_text or not new_text.strip():
+            return {"success": False, "message": "事实文本不能为空"}
+        try:
+            # ChromaDB update 需同时提供 documents，metadata 不传则保留原值
+            self.conversation_collection.update(
+                ids=[fact_id],
+                documents=[new_text.strip()],
+            )
+            logger.info(f"事实记忆已纠正: {fact_id} -> {new_text[:50]}")
+            return {"success": True, "message": "事实已纠正"}
+        except Exception as e:
+            logger.error(f"纠正事实记忆失败: {e}")
+            return {"success": False, "message": str(e)}
 
     def retrieve_memories(
         self,
@@ -216,47 +428,58 @@ class VectorStore:
             包含 text, emotion, timestamp, category, role, final_score 的字典列表
         """
         try:
-            # 使用向量相似度检索，多取一些用于后续按 user_id 过滤
+            # 向量相似度检索：带 user_id + 排除 fact 的 where 过滤，
+            # 避免多用户场景下其他用户记忆挤占 top_k 名额
             results = self.conversation_collection.query(
                 query_texts=[query],
-                n_results=top_k * 5,
+                n_results=top_k * 3,
+                where={"$and": [
+                    {"user_id": user_id},
+                    {"memory_type": {"$ne": "fact"}},
+                ]},
             )
-            
+
             memories = []
             if results and results["documents"] and results["documents"][0]:
-                for doc, meta, distance in zip(
+                for doc_id, doc, meta, distance in zip(
+                    results["ids"][0],
                     results["documents"][0],
                     results["metadatas"][0],
                     results["distances"][0],
                 ):
-                    # 过滤出当前用户的记忆
-                    if meta.get("user_id") == user_id:
-                        # ChromaDB 返回的是距离，越小越相似，转换为相似度分数
-                        similarity = 1.0 / (1.0 + distance)
-                        
-                        memory = {
-                            "text": doc,
-                            "emotion": meta.get("emotion", "unknown"),
-                            "timestamp": meta.get("timestamp", ""),
-                            "category": meta.get("category", ""),
-                            "role": meta.get("role", "user"),
-                            "similarity": round(similarity, 4),
-                            "retrieval_count": int(meta.get("retrieval_count", "0")),
-                        }
-                        
-                        # 应用权重衰减
-                        if apply_decay:
-                            memory["final_score"] = self._calculate_memory_weight(
-                                memory
-                            )
-                        else:
-                            memory["final_score"] = similarity
-                        
-                        memories.append(memory)
-                        
-                        # 更新检索次数
-                        self._increment_retrieval_count(doc, meta)
-                    
+                    # 双保险过滤（where 已限定，此处兜底）
+                    if meta.get("user_id") != user_id:
+                        continue
+                    if meta.get("memory_type") == "fact":
+                        continue
+
+                    # ChromaDB 返回的是距离，越小越相似，转换为相似度分数
+                    similarity = 1.0 / (1.0 + distance)
+
+                    memory = {
+                        "text": doc,
+                        "emotion": meta.get("emotion", "unknown"),
+                        "timestamp": meta.get("timestamp", ""),
+                        "category": meta.get("category", ""),
+                        "role": meta.get("role", "user"),
+                        "memory_type": meta.get("memory_type", "episode"),
+                        "similarity": round(similarity, 4),
+                        "retrieval_count": int(meta.get("retrieval_count", "0")),
+                    }
+
+                    # 应用权重衰减
+                    if apply_decay:
+                        memory["final_score"] = self._calculate_memory_weight(
+                            memory
+                        )
+                    else:
+                        memory["final_score"] = similarity
+
+                    memories.append(memory)
+
+                    # 更新检索次数（频率因子数据来源）
+                    self._increment_retrieval_count(doc_id, meta)
+
                     if len(memories) >= top_k:
                         break
             
@@ -293,8 +516,13 @@ class VectorStore:
         # 2. 使用频率加权
         freq_weight = min(retrieval_count * 0.1, 0.5)  # 最多增加 50%
 
-        # 3. 综合权重
-        final_score = similarity * time_weight * (1 + freq_weight)
+        # 3. 综合权重（结构化事实记忆享受加成系数，优先于零散原文）
+        fact_boost = (
+            settings.MEMORY_FACT_BOOST
+            if memory.get("memory_type") == "fact"
+            else 1.0
+        )
+        final_score = similarity * time_weight * (1 + freq_weight) * fact_boost
 
         return round(final_score, 4)
 
@@ -330,28 +558,28 @@ class VectorStore:
             logger.warning(f"计算时间衰减失败: {e}")
             return 0.5  # 解析失败，返回中等权重
 
-    def _increment_retrieval_count(self, doc: str, meta: Dict[str, Any]) -> None:
+    def _increment_retrieval_count(self, doc_id: str, meta: Dict[str, Any]) -> None:
         """
-        增加记忆的检索次数。
+        增加记忆的检索次数并落库（三因子加权中"频率"因子的数据来源）。
 
         Args:
-            doc: 文档内容
+            doc_id: 记录 id（来自查询结果的 ids）
             meta: 元数据
         """
         try:
-            doc_id = meta.get("id", "")
             if not doc_id:
                 return
 
             current_count = int(meta.get("retrieval_count", "0"))
             new_count = current_count + 1
 
-            # 更新 metadata
+            # 更新 metadata（ChromaDB update 支持只改 metadata，文本保留原值）
             new_meta = meta.copy()
             new_meta["retrieval_count"] = str(new_count)
-
-            # ChromaDB 不支持直接更新 metadata，需要删除后重新添加
-            # 这里只记录日志，实际更新需要在下次存储时处理
+            self.conversation_collection.update(
+                ids=[doc_id],
+                metadatas=[new_meta],
+            )
             logger.debug(f"记忆检索次数更新: {doc_id} ({current_count} -> {new_count})")
         except Exception as e:
             logger.warning(f"更新检索次数失败: {e}")
@@ -435,6 +663,86 @@ class VectorStore:
             logger.error(f"向量分类失败: {e}")
             return "chitchat", 0.5
 
+    def get_similar_seeds(self, text: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """
+        获取与文本最相似的分类种子（供 GuardAgent LLM 仲裁做 few-shot 示例）。
+
+        Args:
+            text: 用户消息
+            top_k: 返回最相似的 top_k 个种子
+
+        Returns:
+            [{"text": ..., "category": ..., "distance": ...}] 列表
+        """
+        try:
+            results = self.classification_collection.query(
+                query_texts=[text],
+                n_results=top_k,
+            )
+            seeds = []
+            if results and results["documents"] and results["documents"][0]:
+                for doc, meta, distance in zip(
+                    results["documents"][0],
+                    results["metadatas"][0],
+                    results["distances"][0],
+                ):
+                    seeds.append(
+                        {
+                            "text": doc,
+                            "category": meta.get("category", "chitchat"),
+                            "distance": round(distance, 4),
+                        }
+                    )
+            return seeds
+        except Exception as e:
+            logger.error(f"获取相似种子失败: {e}")
+            return []
+
+    def add_classification_seed(
+        self, text: str, category: str, source: str = "feedback"
+    ) -> Dict[str, Any]:
+        """
+        添加一条分类种子（错分反馈闭环的核心）。
+
+        用户纠正错分后，将 (消息, 正确类别) 作为新种子写入向量库，
+        后续同类消息的向量分类即可命中，实现分类系统自我改进。
+
+        Args:
+            text: 被错分的消息原文
+            category: 用户纠正后的正确类别
+            source: 种子来源（feedback=错分回流 / manual=手动补充）
+
+        Returns:
+            {"success": bool, "seed_id": str, "message": str}
+        """
+        if category not in ("coding", "career", "emotional", "chitchat"):
+            return {
+                "success": False,
+                "seed_id": "",
+                "message": f"非法类别: {category}",
+            }
+
+        seed_id = f"seed_{source}_{uuid.uuid4().hex[:8]}"
+        try:
+            self.classification_collection.add(
+                documents=[text],
+                metadatas=[{"category": category, "source": source}],
+                ids=[seed_id],
+            )
+            total = self.classification_collection.count()
+            logger.info(
+                f"分类种子回流成功: {seed_id} -> {category} "
+                f"(source={source}, 当前种子总数={total})"
+            )
+            return {
+                "success": True,
+                "seed_id": seed_id,
+                "message": f"种子已回流，当前种子总数: {total}",
+            }
+        except Exception as e:
+            logger.error(f"分类种子回流失败: {e}")
+            return {"success": False, "seed_id": "", "message": str(e)}
+
     def get_user_profile(self, user_id: str) -> Dict[str, Any]:
         """
         获取用户画像。若不存在则返回默认画像。
@@ -472,18 +780,14 @@ class VectorStore:
         try:
             profile_json = json.dumps(profile, ensure_ascii=False)
             metadata = {"user_id": user_id, "type": "profile"}
-            try:
-                self.profile_collection.update(
-                    ids=[profile_id],
-                    documents=[profile_json],
-                    metadatas=[metadata],
-                )
-            except Exception:
-                self.profile_collection.add(
-                    ids=[profile_id],
-                    documents=[profile_json],
-                    metadatas=[metadata],
-                )
+            # upsert：存在则更新，不存在则插入。
+            # 不能用 update + add 回退——chromadb 1.x 的 update 对不存在的
+            # id 静默忽略（不抛异常），新用户画像将永远无法写入
+            self.profile_collection.upsert(
+                ids=[profile_id],
+                documents=[profile_json],
+                metadatas=[metadata],
+            )
             logger.info(f"用户画像已保存: user={user_id}")
         except Exception as e:
             logger.error(f"保存用户画像失败: {e}")
@@ -635,32 +939,36 @@ class VectorStore:
     def compress_memories(
         self,
         user_id: str,
-        max_memories: int = 50,
-        keep_recent: int = 10,
+        max_memories: int = 200,
+        keep_recent: int = 100,
     ) -> Dict[str, Any]:
         """
-        记忆压缩与摘要：定期生成记忆摘要，节省存储空间。
+        记忆容量治理：episode 记忆超量时真实删除陈旧条目。
 
-        流程：
-          1. 获取用户所有记忆
-          2. 如果超过 max_memories，则进行压缩
-          3. 保留最近 keep_recent 条记忆
-          4. 将其余记忆按类别分组生成摘要
-          5. 返回压缩统计信息
+        规则：
+          1. 只统计 episode 记忆（用户消息 + AI 回复），fact 记忆永不删除
+          2. episode 数量超过 max_memories 时触发压缩
+          3. 按 timestamp 降序保留最近 keep_recent 条，其余从向量库真实删除
+          4. 压缩统计写入用户画像 memory_compression 字段（保留审计痕迹）
 
         Args:
             user_id: 用户唯一标识
-            max_memories: 最大记忆数量阈值
-            keep_recent: 保留的最近记忆数量
+            max_memories: episode 记忆数量阈值（超过才触发压缩）
+            keep_recent: 压缩后保留的最近记忆条数
 
         Returns:
             压缩统计信息字典
         """
         try:
-            # 获取用户所有记忆
+            # 获取用户所有 episode 记忆（覆盖 user/assistant 两种 role）
             results = self.conversation_collection.get(
-                where={"user_id": user_id, "role": "user"},
-                limit=200,
+                where={
+                    "$and": [
+                        {"user_id": user_id},
+                        {"memory_type": {"$ne": "fact"}},
+                    ]
+                },
+                limit=5000,
             )
 
             if not results or not results["documents"]:
@@ -674,7 +982,7 @@ class VectorStore:
                     "message": f"记忆数量 ({total_memories}) 未超过阈值 ({max_memories})",
                 }
 
-            # 按时间排序
+            # 按时间降序排序（timestamp 为 "YYYY-MM-DD HH:MM:SS" 字符串，可直接比较）
             memories_with_meta = list(
                 zip(results["documents"], results["metadatas"], results["ids"])
             )
@@ -682,47 +990,42 @@ class VectorStore:
                 key=lambda x: x[1].get("timestamp", ""), reverse=True
             )
 
-            # 保留最近的记忆
+            # 保留最近 keep_recent 条，其余真实删除
             recent_memories = memories_with_meta[:keep_recent]
+            stale_memories = memories_with_meta[keep_recent:]
+            stale_ids = [doc_id for _, _, doc_id in stale_memories]
 
-            # 将其余记忆按类别分组
+            if stale_ids:
+                self.conversation_collection.delete(ids=stale_ids)
+
+            # 将被删记忆按类别分组，统计写入画像（保留压缩痕迹，不存原文）
             category_groups = {}
-            for doc, meta, doc_id in memories_with_meta[keep_recent:]:
+            for doc, meta, doc_id in stale_memories:
                 category = meta.get("category", "unknown")
-                if category not in category_groups:
-                    category_groups[category] = []
-                category_groups[category].append(doc)
+                category_groups[category] = category_groups.get(category, 0) + 1
 
-            # 生成类别摘要
-            summaries = {}
-            for category, texts in category_groups.items():
-                summaries[category] = {
-                    "count": len(texts),
-                    "sample_texts": texts[:3],  # 只保留 3 个示例
-                    "summary": f"共 {len(texts)} 条{category}类对话",
-                }
-
-            # 保存摘要到用户画像
             profile = self.get_user_profile(user_id)
             profile["memory_compression"] = {
                 "last_compressed": self._get_current_timestamp(),
                 "total_before": total_memories,
-                "kept_recent": keep_recent,
-                "category_summaries": summaries,
+                "deleted": len(stale_ids),
+                "kept_recent": len(recent_memories),
+                "category_deleted": category_groups,
             }
             self.save_user_profile(user_id, profile)
 
             logger.info(
                 f"记忆压缩完成: user={user_id}, "
-                f"before={total_memories}, after={keep_recent}, "
-                f"categories={list(summaries.keys())}"
+                f"before={total_memories}, deleted={len(stale_ids)}, "
+                f"kept={len(recent_memories)}, categories={category_groups}"
             )
 
             return {
                 "status": "compressed",
                 "total_before": total_memories,
-                "kept_recent": keep_recent,
-                "category_summaries": summaries,
+                "deleted": len(stale_ids),
+                "kept_recent": len(recent_memories),
+                "category_deleted": category_groups,
             }
         except Exception as e:
             logger.error(f"记忆压缩失败: {e}")

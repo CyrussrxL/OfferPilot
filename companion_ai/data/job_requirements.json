@@ -1,0 +1,135 @@
+{
+  "AI Agent 开发工程师": {
+    "description": "大模型应用层开发，构建 Agent 编排、工具调用、RAG 系统",
+    "core_skills": [
+      "Python 工程能力",
+      "LangChain / LangGraph 等 Agent 编排框架",
+      "Prompt Engineering 与 Function Calling",
+      "RAG 系统设计（向量库、Embedding、召回重排）",
+      "MCP 等工具协议接入",
+      "多 Agent 协作架构设计"
+    ],
+    "bonus_skills": [
+      "有自建 MCP Server 或开源 Agent 项目经验",
+      "记忆系统 / 长期状态管理设计经验",
+      "LLM 评测体系搭建经验",
+      "流式输出与前端交互联调"
+    ],
+    "focus": "工程落地能力：能否把 LLM 能力组装成稳定可用的系统"
+  },
+  "大模型算法工程师": {
+    "description": "模型训练与调优，包括预训练、微调、对齐",
+    "core_skills": [
+      "PyTorch 深度学习框架",
+      "Transformer 架构原理",
+      "微调技术（LoRA / QLoRA / 全参微调）",
+      "分布式训练（DeepSpeed / FSDP）",
+      "数据清洗与构造",
+      "模型评测（Benchmark 设计）"
+    ],
+    "bonus_skills": [
+      "有论文复现或科研经历",
+      "RLHF / DPO 对齐经验",
+      "推理加速（vLLM / 量化）经验"
+    ],
+    "focus": "深度与复现能力：对底层原理的掌握程度"
+  },
+  "NLP 算法工程师": {
+    "description": "自然语言处理方向，文本理解、信息抽取、检索",
+    "core_skills": [
+      "Python 与常用数据科学栈",
+      "NLP 基础任务（分类 / NER / 关系抽取）",
+      "文本向量与语义检索（BM25 / 双塔 / 重排）",
+      "BERT / Transformer 系模型应用",
+      "数据标注与badcase分析"
+    ],
+    "bonus_skills": [
+      "知识图谱构建经验",
+      "搜索或推荐系统背景",
+      "大模型信息抽取经验"
+    ],
+    "focus": "任务建模能力：把业务问题转化为 NLP 问题"
+  },
+  "后端开发工程师": {
+    "description": "服务端开发，高并发系统设计与实现",
+    "core_skills": [
+      "Java / Go / Python 至少一门主力语言",
+      "MySQL / Redis 等存储与缓存",
+      "消息队列（Kafka / RocketMQ）",
+      "微服务与分布式系统基础",
+      "高并发场景设计（秒杀 / 限流）",
+      "Linux 与网络基础"
+    ],
+    "bonus_skills": [
+      "K8s 容器化部署经验",
+      "性能调优实战经历",
+      "开源项目贡献"
+    ],
+    "focus": "系统设计能力：技术选型的权衡与容量估算"
+  },
+  "大模型应用开发工程师": {
+    "description": "LLM 应用层研发，对话系统、Copilot、知识库问答",
+    "core_skills": [
+      "Python 后端开发（FastAPI / Django）",
+      "LLM API 集成与调优",
+      "RAG 与知识库问答系统",
+      "Agent 与工具链开发",
+      "Prompt 与上下文工程",
+      "接口设计与前后端协作"
+    ],
+    "bonus_skills": [
+      "多模态应用经验",
+      "成本与延迟优化经验",
+      "A/B 测试与效果评估经验"
+    ],
+    "focus": "产品化能力：从 demo 到可靠服务的工程化"
+  },
+  "数据挖掘工程师": {
+    "description": "业务数据建模与算法落地",
+    "core_skills": [
+      "SQL 与数据仓库",
+      "Python 数据分析栈（Pandas / Sklearn）",
+      "特征工程",
+      "机器学习建模（GBDT / 深度模型）",
+      "AB 实验设计与分析"
+    ],
+    "bonus_skills": [
+      "大规模数据处理（Spark）经验",
+      "推荐 / 风控 / 搜索某一领域深耕",
+      "因果推断基础"
+    ],
+    "focus": "业务理解：指标定义与 ROI 量化"
+  },
+  "算法测试开发工程师": {
+    "description": "AI 产品质量保障，评测体系与自动化",
+    "core_skills": [
+      "Python 自动化测试",
+      "LLM 效果评测方法（人工标注 / 自动指标）",
+      "测试用例设计与 badcase 管理",
+      "数据构造与回归测试",
+      "接口与性能测试"
+    ],
+    "bonus_skills": [
+      "评测集建设经验",
+      "标注平台使用经验",
+      "CI/CD 集成经验"
+    ],
+    "focus": "质量意识：如何科学地度量不可确定性的系统"
+  },
+  "前端开发工程师": {
+    "description": "Web 前端与 AI 交互界面开发",
+    "core_skills": [
+      "JavaScript / TypeScript",
+      "Vue / React 框架",
+      "状态管理与组件设计",
+      "HTTP 与前后端联调",
+      "流式渲染（SSE / WebSocket）"
+    ],
+    "bonus_skills": [
+      "AI 对话类产品开发经验",
+      "性能优化（首屏 / 长列表）",
+      "跨端开发经验"
+    ],
+    "focus": "交互实现能力：复杂状态流的界面表达"
+  }
+}

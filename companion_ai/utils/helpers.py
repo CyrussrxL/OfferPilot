@@ -7,6 +7,56 @@ def get_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def invoke_llm_with_tools(llm, prompt: str, tools: List) -> tuple:
+    """
+    LLM 工具调用循环（单轮工具调用 + 结果回填）。
+
+    流程：
+      1. bind_tools 绑定工具 schema
+      2. LLM 决定是否调用工具（Function Calling）
+      3. 有 tool_calls → 执行工具（LangChain @tool，内部 MCP 优先 + 本地降级）
+         → 结果以 ToolMessage 回填 → LLM 基于工具结果生成最终回复
+      4. 无 tool_calls → 直接返回
+
+    Args:
+        llm: ChatOpenAI 实例
+        prompt: 完整提示词
+        tools: LangChain @tool 工具列表
+
+    Returns:
+        (最终回复文本, 已执行的工具调用记录列表)
+    """
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    llm_with_tools = llm.bind_tools(tools)
+    response = llm_with_tools.invoke(prompt)
+
+    tool_calls = getattr(response, "tool_calls", None)
+    if not tool_calls:
+        return response.content, []
+
+    messages = [HumanMessage(content=prompt), response]
+    executed = []
+    for tc in tool_calls:
+        tool = next((t for t in tools if t.name == tc["name"]), None)
+        if tool is None:
+            continue
+        try:
+            result = tool.invoke(tc["args"])
+        except Exception as e:  # noqa: BLE001
+            result = {"success": False, "error": str(e)}
+        executed.append({"tool": tc["name"], "args": tc["args"]})
+        messages.append(
+            ToolMessage(
+                content=safe_json_dumps(result),
+                tool_call_id=tc["id"],
+            )
+        )
+
+    final = llm_with_tools.invoke(messages)
+    return final.content, executed
+
+
 def emotion_intensity(score: float) -> str:
     """
     将情感分数映射为强度等级：
@@ -43,15 +93,23 @@ def truncate_text(text: str, max_length: int = 500) -> str:
 def format_memories(memories: List[Dict]) -> str:
     """
     将检索到的记忆列表格式化为可读文本，供 LLM 上下文使用。
+    事实记忆（fact）标记为 [用户事实]，原文记忆（episode）标记为 [历史对话]。
     """
     if not memories:
         return "暂无相关历史记忆。"
     parts = []
-    for i, mem in enumerate(memories, 1):
+    fact_idx = 0
+    ep_idx = 0
+    for mem in memories:
         text = mem.get("text", "")
         emotion = mem.get("emotion", "unknown")
         ts = mem.get("timestamp", "")
-        parts.append(f"[记忆{i}] ({ts}, 情绪:{emotion}) {text}")
+        if mem.get("memory_type") == "fact":
+            fact_idx += 1
+            parts.append(f"[用户事实{fact_idx}] {text}")
+        else:
+            ep_idx += 1
+            parts.append(f"[历史对话{ep_idx}] ({ts}, 情绪:{emotion}) {text}")
     return "\n".join(parts)
 
 

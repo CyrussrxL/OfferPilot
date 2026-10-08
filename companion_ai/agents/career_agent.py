@@ -29,8 +29,18 @@ from langchain_openai import ChatOpenAI
 
 from companion_ai.graph.state import State
 from companion_ai.memory.vector_store import vector_store
+from companion_ai.tools.career_tools import (
+    evaluate_resume,
+    get_interview_questions,
+    get_job_requirements,
+)
 from companion_ai.utils.config import settings
-from companion_ai.utils.helpers import format_memories, format_user_profile
+from companion_ai.utils.helpers import (
+    format_memories,
+    format_user_profile,
+    get_timestamp,
+    invoke_llm_with_tools,
+)
 from companion_ai.utils.logger import logger
 
 
@@ -61,17 +71,6 @@ def _build_career_prompt(state: State) -> str:
     memories_text = format_memories(memories)
     profile_text = format_user_profile(profile)
 
-    style_instruction = ""
-    if emotion_label == "negative":
-        style_instruction = (
-            "用户当前情绪较低落，请用温暖、鼓励的语气给出建议，"
-            "强调每个人都有自己的节奏，不要过于焦虑。"
-        )
-    elif emotion_label == "positive":
-        style_instruction = (
-            "用户当前情绪积极，可以用更有挑战性的建议激励用户继续前进。"
-        )
-
     interview_instruction = ""
     if interview_mode:
         interview_instruction = """
@@ -94,9 +93,8 @@ def _build_career_prompt(state: State) -> str:
 ## 相关历史记忆
 {memories_text}
 
-## 当前情绪状态
+## 当前情绪状态（仅供参考，专业内容为本）
 情绪标签: {emotion_label}, 情绪分数: {emotion_score:.2f}
-{style_instruction}
 
 {interview_instruction}
 
@@ -108,11 +106,18 @@ def _build_career_prompt(state: State) -> str:
 2. 实习投递策略：推荐适合的科技公司
 3. 模拟面试：提出技术/项目/行为面试问题，评价用户回答
 4. 学习路径：根据用户背景推荐学习路线
+5. 技能 Gap 分析：当用户表达目标岗位时，调用 get_job_requirements 获取岗位要求，
+   与用户画像和历史记忆逐项对比，输出 Gap 矩阵（已具备/薄弱/缺失三档），
+   并给出可执行的学习路径；只基于画像和记忆中真实出现过的技能判断"已具备"，
+   没有证据的技能归为"缺失"，不要臆测用户会什么
 
 ## 用户消息
 {message}
 
-请根据用户画像给出专业、有针对性的求职建议。"""
+请根据用户画像给出专业、有针对性的求职建议。
+
+注意：情绪关怀（鼓励安慰）将由 ResponseComposer 统一前置处理，
+你只需专注给出专业的求职建议内容即可。"""
 
     return prompt
 
@@ -124,23 +129,24 @@ def _get_career_mcp_tools_description() -> str:
     根据 MCP 启用状态动态生成工具说明。
     """
     if settings.CAREER_MCP_ENABLED:
-        return """你可以通过以下 MCP 工具增强辅导能力：
-- search_job_listings(position, city, experience, limit): 搜索真实招聘岗位信息
-- analyze_job_requirements(job_description): 分析岗位 JD 的技能要求
-- optimize_resume(resume_text, target_position, target_company): 简历优化（ATS 评分）
-- get_interview_experience(company, position, interview_type): 获取真实面试经验
-- search_interview_questions(topic, difficulty, limit): 搜索面试题目
-- get_salary_info(position, city, experience): 获取岗位薪资信息
+        return """你可以直接调用以下工具（已通过 MCP 协议接入）：
+- evaluate_resume(resume_text): 对简历进行 ATS 风格评分，返回分数、优点与改进建议
+- get_interview_questions(topic, count): 获取面试题（AI/算法/编程/系统设计/行为面试）
+- get_job_requirements(position): 查询目标岗位的技能要求（核心技能/加分项/考察重点）
 
-使用建议：
-- 当用户需要找实习时，建议使用 search_job_listings
-- 当用户需要优化简历时，建议使用 optimize_resume
-- 当用户准备面试时，建议使用 get_interview_experience 和 search_interview_questions
-- 当用户需要了解薪资时，建议使用 get_salary_info"""
+使用时机：
+- 当用户贴出简历内容并希望评估时，务必先调用 evaluate_resume 获取真实评分，
+  再基于评分结果给出针对性修改建议
+- 当需要给用户出模拟面试题时，可调用 get_interview_questions 获取题目
+- 当用户表达求职目标、询问岗位要求或希望做差距分析时（如"我想做Agent开发，
+  还差什么"），务必先调用 get_job_requirements 获取岗位技能要求，
+  再结合用户画像和历史记忆做 Gap 分析
+- 一般性求职咨询、学习路径建议无需调用工具"""
     else:
         return """当前 MCP 工具未启用，你可以使用以下本地工具：
 - evaluate_resume(resume_text): 简历评分（关键词匹配）
-- get_interview_questions(topic, count): 面试题库（固定题库）"""
+- get_interview_questions(topic, count): 面试题库（固定题库）
+- get_job_requirements(position): 查询目标岗位的技能要求（本地知识库）"""
 
 
 def _extract_score(text: str) -> float:
@@ -187,10 +193,19 @@ def career_agent(state: State) -> Dict:
 
     prompt = _build_career_prompt(state)
 
+    executed_tools = []  # LLM 调用失败时保底，避免下方引用未定义变量
     try:
         llm = _get_llm()
-        response = llm.invoke(prompt)
-        career_response = response.content
+        # Function Calling 真实绑定求职工具（内部 MCP 优先 + 本地降级）
+        career_response, executed_tools = invoke_llm_with_tools(
+            llm, prompt,
+            [evaluate_resume, get_interview_questions, get_job_requirements],
+        )
+        if executed_tools:
+            logger.info(
+                f"CareerAgent | user={user_id} | 工具调用: "
+                f"{[t['tool'] for t in executed_tools]}"
+            )
         logger.info(f"CareerAgent | user={user_id} | 回复生成成功")
     except Exception as e:
         logger.error(f"CareerAgent | LLM 调用失败: {e}")
@@ -212,6 +227,17 @@ def career_agent(state: State) -> Dict:
             scores = job_progress.get("interview_scores", [])
             scores.append(interview_score)
             job_progress["interview_scores"] = scores[-10:]
+        # Gap 分析记录：最近一次岗位差距分析（供记忆面板展示学习闭环）
+        gap_positions = [
+            t["args"].get("position", "")
+            for t in (executed_tools or [])
+            if t["tool"] == "get_job_requirements"
+        ]
+        if gap_positions:
+            job_progress["last_gap_analysis"] = {
+                "position": gap_positions[-1],
+                "timestamp": get_timestamp(),
+            }
         job_progress["last_career_advice"] = career_response[:200]
         profile["job_progress"] = job_progress
         vector_store.save_user_profile(user_id, profile)

@@ -29,6 +29,8 @@ class State(TypedDict, total=False):
       emotion_label: 情感标签 (positive/negative/neutral)，由 GuardAgent 产出
       emotion_score: 情感分数 (0.0~1.0)，由 GuardAgent 产出
       message_category: 消息类别 (coding/career/emotional/chitchat)，由 GuardAgent 产出
+      secondary_category: 次要意图类别（主类别之外明确存在的另一意图，如"情绪+求职"
+        混合消息中的情绪意图），无次意图时为空字符串，由 GuardAgent 产出
       retrieved_memories: 检索到的相关历史记忆列表，由 MemoryAgent 产出
       proactive_memories: 主动推送的相关记忆列表，由 MemoryAgent 产出
       user_profile: 用户画像字典，由 MemoryAgent 产出
@@ -39,6 +41,11 @@ class State(TypedDict, total=False):
       interview_mode: 是否处于模拟面试模式
       interview_question: 当前面试问题
       interview_score: 面试评分
+      interview_session: 循环面试状态机的会话状态（跨轮经检查点持久化），
+        包含 questions（已问题目/回答/评分）、awaiting_answer、asked_count、
+        probe_count 等字段，由 interview_evaluate/interview_ask 节点维护
+      interview_response: 面试官节点的本轮输出（追问/新题/反馈），由面试图节点产出
+      interview_report: 面试结束生成的结构化报告（维度评分/薄弱点/学习建议）
       daily_report: 日报内容
       user_behavior: 用户行为特征（输入频率、消息长度、时间段等），由 GuardAgent 分析
       classification_confidence: 分类置信度 (0.0~1.0)，由 GuardAgent 计算
@@ -50,6 +57,7 @@ class State(TypedDict, total=False):
     emotion_label: str
     emotion_score: float
     message_category: str
+    secondary_category: str
     retrieved_memories: List[Dict[str, Any]]
     proactive_memories: List[Dict[str, Any]]
     user_profile: Dict[str, Any]
@@ -60,6 +68,9 @@ class State(TypedDict, total=False):
     interview_mode: bool
     interview_question: str
     interview_score: float
+    interview_session: Dict[str, Any]
+    interview_response: str
+    interview_report: Dict[str, Any]
     daily_report: str
     user_behavior: Dict[str, Any]
     classification_confidence: float

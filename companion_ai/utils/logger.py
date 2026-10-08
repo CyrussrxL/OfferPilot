@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 
-def setup_logger(name: str = "CompanionAI", level: str = "INFO") -> logging.Logger:
+def setup_logger(name: str = "OfferPilot", level: str = "INFO") -> logging.Logger:
     """
     配置并返回一个统一的 Logger 实例。
     同时输出到控制台和文件，文件按日期命名。

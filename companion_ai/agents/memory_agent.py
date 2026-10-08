@@ -2,22 +2,28 @@
 MemoryAgent —— 记忆 Agent
 
 职责：
-  1. 从 ChromaDB 中检索与当前用户消息相关的历史对话（相似度 top-3）
-  2. 获取用户画像（学习进度、求职目标、近期情绪趋势）
-  3. 将当前消息和情感分析结果存入向量库
-  4. 更新用户画像中的情绪趋势
+  1. 双路召回：事实记忆（LLM 提取的结构化用户事实，高权重）
+     + 原文记忆（历史对话，带时间衰减/频率加权）
+  2. 主动记忆检索（根据情绪状态推送相关记忆）
+  3. 获取用户画像
+  4. 将当前消息和情感分析结果存入向量库
+  5. 对话后事实提取（LLM 抽取结构化用户事实）
+  6. 更新用户画像中的情绪趋势
+  7. 周期性画像反思（每 N 次对话，LLM 合并事实更新画像）
 
 设计理由：
-  - 记忆检索为后续 Agent 提供上下文，使回复具备连续性和个性化。
-  - 用户画像让 Agent 了解用户的长期目标，避免每次对话从零开始。
-  - 存储当前对话确保记忆持续积累，支持长期记忆能力。
-  - 情绪趋势更新为 EmotionAgent 的主动关怀提供数据基础。
+  - "事实 + 原文"双路召回：事实记忆信息密度高、无情绪噪音，
+    原文记忆保留对话细节，两路互补（对齐 Generative Agents）。
+  - 事实提取让记忆从"存经历"升级为"存认知"，检索质量随对话累积提升。
+  - 周期性反思模拟人类"定期回顾沉淀"，画像更新平滑而非被单条对话带偏。
 """
 
 from typing import Dict
 
 from companion_ai.graph.state import State
+from companion_ai.memory.memory_reflection import extract_facts, reflect_on_profile
 from companion_ai.memory.vector_store import vector_store
+from companion_ai.utils.config import settings
 from companion_ai.utils.helpers import get_timestamp
 from companion_ai.utils.logger import logger
 
@@ -27,13 +33,13 @@ def memory_agent(state: State) -> Dict:
     MemoryAgent 节点函数。
 
     流程：
-      1. 从状态中获取用户消息、情感标签、消息类别
-      2. 检索相关历史记忆（top-3，应用权重衰减）
-      3. 主动记忆检索（根据情绪状态推送相关记忆）
-      4. 获取用户画像
-      5. 将当前消息存入向量库
+      1. 双路召回：事实记忆（top-2）+ 原文记忆（top-3，权重衰减）
+      2. 主动记忆检索（根据情绪状态推送相关记忆）
+      3. 获取用户画像
+      4. 将当前消息存入向量库（episode）
+      5. 事实提取：LLM 从当前消息抽取结构化用户事实（fact）
       6. 更新情绪趋势
-      7. 检查是否需要记忆压缩
+      7. 检查记忆压缩 + 周期性画像反思
       8. 返回更新后的状态字段
 
     Args:
@@ -48,13 +54,23 @@ def memory_agent(state: State) -> Dict:
     emotion_score = state.get("emotion_score", 0.5)
     message_category = state.get("message_category", "chitchat")
 
-    # 1. 检索相关历史记忆（应用权重衰减）
-    retrieved_memories = vector_store.retrieve_memories(
+    # 1a. 事实记忆召回（高权重、信息密度高）
+    fact_memories = vector_store.retrieve_facts(
+        user_id=user_id,
+        query=message,
+        top_k=2,
+    )
+
+    # 1b. 原文记忆召回（历史对话，应用权重衰减）
+    episode_memories = vector_store.retrieve_memories(
         user_id=user_id,
         query=message,
         top_k=3,
         apply_decay=True,
     )
+
+    # 合并双路结果：事实在前（权重加成后通常得分更高）
+    retrieved_memories = fact_memories + episode_memories
 
     # 2. 主动记忆检索（根据情绪状态推送相关记忆）
     proactive_memories = vector_store.proactive_memory_retrieval(
@@ -67,7 +83,7 @@ def memory_agent(state: State) -> Dict:
     # 3. 获取用户画像
     user_profile = vector_store.get_user_profile(user_id)
 
-    # 4. 将当前消息存入向量库
+    # 4. 将当前消息存入向量库（episode 原文记忆）
     timestamp = get_timestamp()
     vector_store.store_conversation(
         user_id=user_id,
@@ -76,27 +92,50 @@ def memory_agent(state: State) -> Dict:
         category=message_category,
         timestamp=timestamp,
         role="user",
+        memory_type="episode",
     )
 
-    # 5. 更新情绪趋势
-    vector_store.update_emotional_trend(user_id, emotion_score)
+    # 5. 事实提取：LLM 抽取结构化用户事实（fact 记忆）
+    extract_facts(user_id=user_id, message=message)
 
-    # 6. 检查是否需要记忆压缩（每 10 次对话检查一次）
+    # 6. 更新对话计数（先保存，避免覆盖下一步写入的情绪趋势：
+    #    user_profile 是本轮开头取的快照，若在 update_emotional_trend
+    #    之后保存，会把刚追加的 emotion_score 抹掉）
     conversation_count = user_profile.get("conversation_count", 0) + 1
     user_profile["conversation_count"] = conversation_count
     vector_store.save_user_profile(user_id, user_profile)
 
+    # 7. 更新情绪趋势（内部重新读取最新画像后追加落库；同时同步回本地
+    #    快照——下游节点（如 CareerAgent）会用 state 中的画像回写存储，
+    #    若快照缺最新趋势，回写时会把趋势覆盖掉）
+    user_profile["emotional_trend"] = vector_store.update_emotional_trend(
+        user_id, emotion_score
+    )
+
+    # 8. 记忆容量治理（每 10 次对话检查一次）
+    #    每轮写 2 条 episode（用户消息 + AI 回复），200 条 ≈ 100 轮后首次触发，
+    #    压缩后保留最近 100 条（≈ 50 轮完整对话），fact 记忆不受影响
     if conversation_count % 10 == 0:
         compression_result = vector_store.compress_memories(
             user_id=user_id,
-            max_memories=50,
-            keep_recent=10,
+            max_memories=200,
+            keep_recent=100,
         )
         logger.info(f"记忆压缩检查: {compression_result.get('status', 'unknown')}")
 
+    # 9. 周期性画像反思（每 N 次对话触发一次，LLM 合并事实更新画像）
+    if conversation_count % settings.MEMORY_REFLECTION_INTERVAL == 0:
+        reflection_result = reflect_on_profile(user_id)
+        if reflection_result.get("success"):
+            user_profile = reflection_result["profile"]
+        logger.info(
+            f"画像反思: user={user_id}, "
+            f"result={reflection_result.get('message', 'unknown')}"
+        )
+
     logger.info(
         f"MemoryAgent | user={user_id} | "
-        f"memories={len(retrieved_memories)} | "
+        f"facts={len(fact_memories)} | episodes={len(episode_memories)} | "
         f"proactive={len(proactive_memories)} | "
         f"profile_keys={list(user_profile.keys())}"
     )

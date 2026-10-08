@@ -2,7 +2,7 @@
 FastAPI 后端服务 —— main.py
 
 职责：
-  提供 RESTful API 接口，将 CompanionAI 的核心功能暴露为 Web 服务：
+  提供 RESTful API 接口，将 OfferPilot 的核心功能暴露为 Web 服务：
     - /api/chat: 处理用户消息，返回 AI 回复
     - /api/chat/stream: 流式返回 AI 回复
     - /api/conversations: 获取对话历史列表
@@ -37,8 +37,8 @@ from companion_ai.utils.logger import logger
 
 
 app = FastAPI(
-    title="CompanionAI API",
-    description="多 Agent 协作的智能聊天伙伴系统 API",
+    title="OfferPilot API",
+    description="多 Agent 智能求职领航系统 API",
     version="1.0.0",
 )
 
@@ -117,7 +117,7 @@ def load_saved_conversations(user_id: Optional[str] = None) -> List[Conversation
 @app.get("/")
 async def root():
     return {
-        "service": "CompanionAI",
+        "service": "OfferPilot",
         "version": "1.0.0",
         "status": "running",
         "docs": "/docs",
@@ -311,6 +311,85 @@ async def generate_report(user_id: str):
         return {"success": True, "user_id": user_id, "report": report}
     except Exception as e:
         logger.error(f"API /api/report/{user_id} | 生成失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ClassificationCorrectionRequest(BaseModel):
+    user_id: str = Field(default=settings.DEFAULT_USER_ID, description="用户 ID")
+    message: str = Field(..., description="被错分的消息原文")
+    correct_category: str = Field(
+        ..., description="正确的类别（coding/career/emotional/chitchat）"
+    )
+
+
+class FactCorrectionRequest(BaseModel):
+    fact_text: str = Field(..., description="纠正后的事实文本")
+
+
+@app.get("/api/memory/facts/{user_id}")
+async def list_facts(user_id: str):
+    """列出用户全部事实记忆（含记录 id，供删除/纠正定位）"""
+    try:
+        facts = vector_store.get_facts_with_metadata(user_id)
+        return {"success": True, "user_id": user_id, "count": len(facts), "facts": facts}
+    except Exception as e:
+        logger.error(f"API /api/memory/facts/{user_id} | 失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/memory/facts/{user_id}/{fact_id}")
+async def delete_fact(user_id: str, fact_id: str):
+    """删除一条事实记忆（用户可控记忆）"""
+    try:
+        result = vector_store.delete_fact(fact_id)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("message", "删除失败"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API /api/memory/facts/{user_id}/{fact_id} DELETE | 失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/memory/facts/{user_id}/{fact_id}")
+async def update_fact(user_id: str, fact_id: str, request: FactCorrectionRequest):
+    """纠正一条事实记忆（用户可控记忆）"""
+    try:
+        result = vector_store.update_fact(fact_id, request.fact_text)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("message", "纠正失败"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API /api/memory/facts/{user_id}/{fact_id} PUT | 失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/classification/correction")
+async def correct_classification(request: ClassificationCorrectionRequest):
+    """
+    分类错分纠正（GuardAgent 反馈闭环入口）。
+
+    用户发现路由错分后提交 (消息, 正确类别)，系统将其回流为新的
+    分类种子，后续同类消息的向量分类即可命中，实现自我改进。
+    """
+    try:
+        from companion_ai.agents.guard_agent import record_classification_correction
+
+        result = record_classification_correction(
+            user_id=request.user_id,
+            message=request.message,
+            correct_category=request.correct_category,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("message", "纠正失败"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API /api/classification/correction | 处理失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

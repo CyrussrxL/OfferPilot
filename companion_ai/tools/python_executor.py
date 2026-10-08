@@ -33,7 +33,8 @@ def execute_python_code(code: str) -> Dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=30,
-            encoding='utf-8'
+            encoding='utf-8',
+            stdin=subprocess.DEVNULL,  # 断开继承的 stdin（MCP stdio 管道环境下孙进程会挂起）
         )
         
         os.unlink(temp_file_path)

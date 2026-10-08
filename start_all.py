@@ -1,5 +1,5 @@
 """
-CompanionAI 启动脚本 —— start_all.py
+OfferPilot 启动脚本 —— start_all.py
 
 功能：
   1. 启动 FastAPI 后端服务（后台运行）
@@ -55,7 +55,7 @@ def start_frontend():
 def main():
     """主函数：启动后端和前端"""
     print("=" * 60)
-    print("🤖 CompanionAI - 多 Agent 协作的智能聊天伙伴系统")
+    print("🧭 OfferPilot - 多 Agent 智能求职领航系统")
     print("=" * 60)
 
     backend_process = None

@@ -24,8 +24,13 @@ from typing import Dict
 from langchain_openai import ChatOpenAI
 
 from companion_ai.graph.state import State
+from companion_ai.tools.mcp_tools import execute_code_sandbox
 from companion_ai.utils.config import settings
-from companion_ai.utils.helpers import format_memories, format_user_profile
+from companion_ai.utils.helpers import (
+    format_memories,
+    format_user_profile,
+    invoke_llm_with_tools,
+)
 from companion_ai.utils.logger import logger
 
 
@@ -49,9 +54,11 @@ def _build_coding_prompt(state: State) -> str:
       - 角色定义
       - 用户画像信息
       - 历史记忆上下文
-      - 情绪感知指令（风格切换）
-      - 主动学习建议指令
+      - 情绪状态原始值（供 Agent 参考，但风格统一由 ResponseComposer 处理）
       - MCP 工具推荐说明
+
+    注意：情绪关怀逻辑（风格指令、主动安慰）统一收口到 ResponseComposer，
+    避免各 Agent 重复注入情绪指令浪费 token。
     """
     message = state.get("current_message", "")
     emotion_label = state.get("emotion_label", "neutral")
@@ -61,29 +68,6 @@ def _build_coding_prompt(state: State) -> str:
 
     memories_text = format_memories(memories)
     profile_text = format_user_profile(profile)
-
-    style_instruction = ""
-    if emotion_label == "negative":
-        style_instruction = (
-            "用户当前情绪较低落，请用温柔、鼓励的语气回复，"
-            "避免过于技术化或生硬的表达，先关心用户的感受。"
-        )
-    elif emotion_label == "positive":
-        style_instruction = (
-            "用户当前情绪积极，可以用活泼、鼓励的语气回复，"
-            "适当增加挑战性建议。"
-        )
-
-    proactive_learning = ""
-    emotional_trend = profile.get("emotional_trend", [])
-    if len(emotional_trend) >= 3 and all(
-        s < 0.4 for s in emotional_trend[-3:]
-    ):
-        proactive_learning = (
-            "重要：用户近期情绪持续低落，请在回复末尾主动建议调整学习节奏，"
-            "例如：'我注意到你最近有些疲惫，要不先休息一下？学习是马拉松，不是短跑。'"
-        )
-
     mcp_tools_desc = _get_mcp_tools_description()
 
     prompt = f"""你是一位专业的编程学习辅导老师，擅长 Python、算法和数据结构。
@@ -103,11 +87,8 @@ def _build_coding_prompt(state: State) -> str:
 ## 相关历史记忆
 {memories_text}
 
-## 当前情绪状态
+## 当前情绪状态（仅供参考，专业内容为本）
 情绪标签: {emotion_label}, 情绪分数: {emotion_score:.2f}
-{style_instruction}
-
-{proactive_learning}
 
 ## 用户消息
 {message}
@@ -121,24 +102,29 @@ def _get_mcp_tools_description() -> str:
     """
     获取 MCP 工具描述字符串。
 
-    根据 MCP 启用状态动态生成工具说明。
+    工具通过 Function Calling 真实绑定（bind_tools），LLM 可直接调用；
+    沙箱工具内部优先走自建 MCP Tool Server（stdio），失败自动降级本地执行。
     """
     if settings.MCP_ENABLED:
-        return """你可以通过以下 MCP 工具增强辅导能力：
-- execute_code_sandbox(code, language): 在安全沙箱中执行代码，验证正确性
-- get_leetcode_problem(problem_id, difficulty, tag): 获取 LeetCode 真实题目信息
-- search_leetcode_problems(difficulty, tag, limit): 搜索 LeetCode 题目列表
-- search_github_repositories(query, sort, limit): 搜索 GitHub 开源项目
-- get_github_repository_info(owner, repo): 获取 GitHub 仓库详细信息
-- search_github_code(query, language, limit): 搜索 GitHub 真实代码片段
+        return """你可以直接调用以下工具（已通过 MCP 协议接入）：
+- execute_code_sandbox(code, language): 在安全沙箱中执行代码并返回运行结果
 
-使用建议：
-- 当用户需要验证代码时，建议使用 execute_code_sandbox
-- 当用户需要练习题时，建议使用 search_leetcode_problems
-- 当用户需要项目参考时，建议使用 search_github_repositories"""
+调用规则（严格）：
+- 【必须调用】仅当用户明确需要"运行代码"时：贴出代码询问运行结果、
+  要求验证正确性、报错求助调试
+- 【禁止调用】讲解算法思想、对比概念、推荐题目等纯概念问题，一律不调用
+- 【禁止调用】讲解过程中你自己写的示例代码，不要主动执行——直接以文本
+  给出示例与讲解即可，除非用户明确要求运行"""
     else:
-        return """当前 MCP 工具未启用，你可以使用以下本地工具：
-- execute_python_code(code): 执行 Python 代码（本地执行）"""
+        return """你可以直接调用以下工具：
+- execute_code_sandbox(code, language): 在安全沙箱中执行代码并返回运行结果
+
+调用规则（严格）：
+- 【必须调用】仅当用户明确需要"运行代码"时：贴出代码询问运行结果、
+  要求验证正确性、报错求助调试
+- 【禁止调用】讲解算法思想、对比概念、推荐题目等纯概念问题，一律不调用
+- 【禁止调用】讲解过程中你自己写的示例代码，不要主动执行——直接以文本
+  给出示例与讲解即可，除非用户明确要求运行"""
 
 
 def coding_agent(state: State) -> Dict:
@@ -163,8 +149,15 @@ def coding_agent(state: State) -> Dict:
 
     try:
         llm = _get_llm()
-        response = llm.invoke(prompt)
-        coding_response = response.content
+        # Function Calling 真实绑定沙箱工具（内部 MCP 优先 + 本地降级）
+        coding_response, executed_tools = invoke_llm_with_tools(
+            llm, prompt, [execute_code_sandbox]
+        )
+        if executed_tools:
+            logger.info(
+                f"CodingAgent | user={user_id} | 工具调用: "
+                f"{[t['tool'] for t in executed_tools]}"
+            )
         logger.info(f"CodingAgent | user={user_id} | 回复生成成功")
     except Exception as e:
         logger.error(f"CodingAgent | LLM 调用失败: {e}")
