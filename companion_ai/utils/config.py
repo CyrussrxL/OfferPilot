@@ -38,8 +38,9 @@ class Settings(BaseSettings):
     # CareerAgent 工具描述开关（工具实际链路由 MCP_ENABLED 控制）
     CAREER_MCP_ENABLED: bool = False
 
-    # 多语言情感模型（中英等 12 种语言，三分类 positive/neutral/negative）
-    SENTIMENT_MODEL_NAME: str = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
+    # 情感分析模型（用户自选：任意 HuggingFace 文本分类模型，
+    # 需输出 positive/negative(/neutral) 标签；留空时走关键词回退方案）
+    SENTIMENT_MODEL_NAME: str = ""
     # 默认使用关键词方案，快速启动
     # 需要模型时设为 True 即可
     SENTIMENT_FALLBACK_ENABLED: bool = False

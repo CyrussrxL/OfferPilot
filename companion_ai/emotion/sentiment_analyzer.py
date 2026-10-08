@@ -5,12 +5,12 @@
   对用户输入文本进行情感分析，返回情感标签（positive/negative/neutral）和情感分数（0~1）。
 
 设计理由：
-  - 默认使用 lxyuan/distilbert-base-multilingual-cased-sentiments-student：
-    6 层 DistilBERT 多语言情感模型（中英等 12 种语言），由 mDeBERTa-v3
-    零样本教师蒸馏而来，直接输出 positive/neutral/negative 三分类，
-    中英文统一走同一模型，无需按语言分流。
-  - 提供基于关键词的本地回退方案：模型加载失败（网络问题、依赖缺失）
-    或 SENTIMENT_FALLBACK_ENABLED=False（快速启动）时兜底，
+  - 情感模型由用户自选（SENTIMENT_MODEL_NAME）：任意 HuggingFace 文本
+    分类模型均可（需输出 positive/negative(/neutral) 标签）。多语言
+    三分类模型（如 lxyuan/distilbert-base-multilingual-cased-sentiments-student）
+    可中英文统一处理，无需按语言分流。
+  - 提供基于关键词的本地回退方案：未配置模型、模型加载失败（网络问题、
+    依赖缺失）或 SENTIMENT_FALLBACK_ENABLED=False（快速启动）时兜底，
     基于中英文情感关键词匹配，覆盖常见的情绪表达。
 """
 
@@ -77,12 +77,21 @@ class SentimentAnalyzer:
         尝试加载 transformers 预训练情感分析 pipeline。
         若加载失败（网络问题、依赖缺失等），自动切换到关键词回退模式。
 
+        模型由用户自选（SENTIMENT_MODEL_NAME，任意 HuggingFace 文本分类
+        模型，需输出 positive/negative(/neutral) 标签），仓库不预置确定模型。
+
         SENTIMENT_FALLBACK_ENABLED 的语义：
           - True（默认）：先尝试加载模型，失败后回退到关键词方案
           - False：直接使用关键词方案，跳过模型加载（适用于无网络或快速启动场景）
         """
         os.environ["HF_ENDPOINT"] = settings.HF_ENDPOINT
-        
+
+        if not settings.SENTIMENT_MODEL_NAME:
+            # 未配置模型（用户未自选）→ 关键词方案
+            self.use_fallback = True
+            logger.info("未配置 SENTIMENT_MODEL_NAME，直接使用关键词方案")
+            return
+
         if settings.SENTIMENT_FALLBACK_ENABLED:
             try:
                 from transformers import pipeline as hf_pipeline
