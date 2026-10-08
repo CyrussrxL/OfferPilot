@@ -1,5 +1,7 @@
 # OfferPilot 🧭
 
+![Tests](https://github.com/CyrussrxL/OfferPilot/actions/workflows/tests.yml/badge.svg)
+
 基于 LangGraph 的多 Agent 智能求职领航系统：编程辅导 · 求职规划 · 循环模拟面试 · 情绪关怀
 
 ## ✨ 功能特性
