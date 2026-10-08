@@ -23,7 +23,7 @@ import sys
 import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from companion_ai.graph.workflow import run_workflow, run_daily_report
 from companion_ai.memory.vector_store import vector_store
+from companion_ai.tools.resume_parser import extract_text_from_file, parse_resume
 from companion_ai.utils.config import settings
 from companion_ai.utils.logger import logger
 
@@ -56,6 +57,12 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息")
     thread_id: Optional[str] = Field(None, description="对话线程 ID")
     interview_mode: bool = Field(default=False, description="是否开启模拟面试模式")
+    resume_summary: Optional[str] = Field(
+        default=None, description="简历结构化摘要（定向面试用，无则按通识面试）"
+    )
+    jd_text: Optional[str] = Field(
+        default=None, description="目标岗位 JD 全文（定向面试用，无则按通识面试）"
+    )
 
 
 class ChatResponse(BaseModel):
@@ -129,17 +136,76 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
+@app.post("/api/resume/upload")
+async def upload_resume(user_id: str = settings.DEFAULT_USER_ID, file: UploadFile = File(default=None)):
+    """上传简历文件（PDF/MD/TXT）→ 提取文本 → LLM 结构化摘要 → 存入用户画像。
+
+    返回结构化摘要；失败时返回原始文本截断与错误信息，链路不中断。
+    """
+    try:
+        if file is None:
+            raise HTTPException(status_code=400, detail="未提供简历文件")
+        content = await file.read()
+        text = extract_text_from_file(content, file.filename or "resume.txt")
+        if not text:
+            raise HTTPException(status_code=400, detail="无法从文件提取文本")
+
+        summary = parse_resume(text)
+        # 存入用户画像，供模拟面试与长期辅导复用
+        profile = vector_store.get_user_profile(user_id)
+        profile["resume_summary"] = summary
+        vector_store.save_user_profile(user_id, profile)
+
+        logger.info(
+            f"API /api/resume/upload | user={user_id} | "
+            f"解析成功={summary.get('success')} | file={file.filename}"
+        )
+        return summary
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API /api/resume/upload | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/resume/text")
+async def parse_resume_text(payload: Dict[str, Any]):
+    """粘贴简历文本 → LLM 结构化摘要 → 存入用户画像。"""
+    try:
+        user_id = payload.get("user_id", settings.DEFAULT_USER_ID)
+        text = payload.get("text", "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="简历文本为空")
+
+        summary = parse_resume(text)
+        profile = vector_store.get_user_profile(user_id)
+        profile["resume_summary"] = summary
+        vector_store.save_user_profile(user_id, profile)
+
+        logger.info(
+            f"API /api/resume/text | user={user_id} | 解析成功={summary.get('success')}"
+        )
+        return summary
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"API /api/resume/text | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """处理用户消息，返回 AI 回复"""
     try:
         logger.info(f"API /api/chat | user={request.user_id} | 收到请求")
-        
+
         result = run_workflow(
             user_id=request.user_id,
             message=request.message,
             thread_id=request.thread_id or f"thread_{request.user_id}",
             interview_mode=request.interview_mode,
+            resume_summary=request.resume_summary,
+            jd_text=request.jd_text,
         )
         
         response = ChatResponse(
@@ -168,8 +234,10 @@ async def chat_stream(request: ChatRequest):
             message=request.message,
             thread_id=request.thread_id or f"thread_{request.user_id}",
             interview_mode=request.interview_mode,
+            resume_summary=request.resume_summary,
+            jd_text=request.jd_text,
         )
-        
+
         final_response = result.get("final_response", "")
         emotion_label = result.get("emotion_label", "neutral")
         emotion_score = result.get("emotion_score", 0.5)

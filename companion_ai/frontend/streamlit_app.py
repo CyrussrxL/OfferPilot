@@ -37,6 +37,7 @@ import plotly.graph_objects as go
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from companion_ai.agents.interview_agent import _infer_interview_topic
+from companion_ai.tools.resume_parser import extract_text_from_file, parse_resume
 from companion_ai.graph.workflow import (
     run_workflow,
     run_daily_report,
@@ -198,6 +199,11 @@ def init_session_state():
         st.session_state.current_conversation_name = None
     if "active_view" not in st.session_state:
         st.session_state.active_view = CHAT_VIEW
+    # 定向面试上下文：简历摘要（brief 字符串）/ JD 全文
+    if "resume_brief" not in st.session_state:
+        st.session_state.resume_brief = ""
+    if "jd_text" not in st.session_state:
+        st.session_state.jd_text = ""
 
 
 def create_new_conversation():
@@ -451,6 +457,8 @@ def process_pending_message(msg):
                     message=prompt,
                     thread_id=st.session_state.thread_id,
                     interview_mode=st.session_state.interview_mode,
+                    resume_summary=st.session_state.resume_brief or None,
+                    jd_text=st.session_state.jd_text or None,
                 )
             response = result.get("final_response", "抱歉，无法生成回复。")
             emotion = result.get("emotion_label", "neutral")
@@ -519,6 +527,8 @@ def finalize_interview():
                 message="结束面试",
                 thread_id=st.session_state.thread_id,
                 interview_mode=True,
+                resume_summary=st.session_state.resume_brief or None,
+                jd_text=st.session_state.jd_text or None,
             )
             report = result.get("final_response", "")
             if report:
@@ -600,9 +610,70 @@ def render_interview_view():
             "✅ 上一场面试已结束，报告已记录到你的画像。发送消息即可开始新一场！"
         )
     else:
+        # ---- 定向面试配置区（未开始时显示） ----
+        # 3A 长期复用：若画像里已存简历摘要，自动加载，用户不必每次重传
+        if not st.session_state.resume_brief:
+            profile_resume = profile.get("resume_summary") or {}
+            if profile_resume.get("brief"):
+                st.session_state.resume_brief = profile_resume["brief"]
+
+        with st.expander("📋 定向面试配置（可选，上传简历+粘贴JD后题目更贴合）", expanded=True):
+            up_col, paste_col = st.columns(2)
+            with up_col:
+                uploaded = st.file_uploader(
+                    "上传简历（PDF/MD/TXT）", type=["pdf", "md", "txt"],
+                    key="resume_upload",
+                )
+            with paste_col:
+                pasted = st.text_area(
+                    "或粘贴简历文本", height=90, key="resume_paste",
+                )
+            if st.button("🔍 解析简历", width="stretch"):
+                try:
+                    if uploaded is not None:
+                        content = uploaded.read()
+                        text = extract_text_from_file(content, uploaded.name)
+                    elif pasted.strip():
+                        text = pasted.strip()
+                    else:
+                        text = ""
+                        st.warning("请上传文件或粘贴文本")
+                    if text:
+                        with st.spinner("正在解析简历..."):
+                            summary = parse_resume(text)
+                        st.session_state.resume_brief = summary.get("brief", "")
+                        # 同步入画像长期复用
+                        profile2 = vector_store.get_user_profile(st.session_state.user_id)
+                        profile2["resume_summary"] = summary
+                        vector_store.save_user_profile(st.session_state.user_id, profile2)
+                        if summary.get("success"):
+                            st.success(f"✅ 解析成功：{summary.get('summary','')}")
+                        else:
+                            st.warning("⚠️ LLM 解析失败，已用原文摘要兜底，仍可定向面试")
+                except Exception as e:
+                    st.error(f"解析失败：{e}")
+
+            st.session_state.jd_text = st.text_area(
+                "目标岗位 JD（粘贴全文，出题会优先考察 JD 技能要求）",
+                value=st.session_state.jd_text,
+                height=100,
+                key="jd_input",
+            )
+
+            # 定向状态指示
+            badges = []
+            if st.session_state.resume_brief:
+                badges.append("✅ 简历已就绪")
+            if st.session_state.jd_text.strip():
+                badges.append("✅ JD 已就绪")
+            mode = "� 定向面试" if badges else "通识面试（按画像定制）"
+            st.caption(" · ".join(badges) + f" → {mode}")
+
         st.info(
-            "🎤 欢迎来到模拟面试！发送任意消息（如「开始面试」）即可开场，"
-            "方向按你的画像定制。切回「对话」视图会自动结束并生成报告。"
+            "�� 欢迎来到模拟面试！" + (
+                "已配置定向信息，发送消息开场将围绕简历项目与 JD 技能出题。" if badges
+                else "发送任意消息（如「开始面试」）即可开场，方向按你的画像定制。"
+            ) + " 切回「对话」视图会自动结束并生成报告。"
         )
 
     # ---- 面试问答历史（与对话共用一条时间线，含待生成消息处理） ----

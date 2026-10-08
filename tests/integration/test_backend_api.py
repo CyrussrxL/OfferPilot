@@ -17,7 +17,8 @@ client = TestClient(app)
 @pytest.fixture
 def mock_workflow(monkeypatch):
     def _install(final_response="mock 回复内容"):
-        def fake_run_workflow(user_id, message, thread_id=None, interview_mode=False):
+        def fake_run_workflow(user_id, message, thread_id=None, interview_mode=False,
+                              resume_summary=None, jd_text=None):
             return {
                 "final_response": final_response,
                 "emotion_label": "neutral",

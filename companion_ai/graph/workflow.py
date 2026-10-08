@@ -216,6 +216,8 @@ def run_workflow(
     message: str,
     thread_id: str = None,
     interview_mode: bool = False,
+    resume_summary: str = None,
+    jd_text: str = None,
 ) -> dict:
     """
     运行完整的工作流，返回最终状态。
@@ -225,6 +227,8 @@ def run_workflow(
         message: 用户消息
         thread_id: 对话线程 ID（用于检查点恢复，面试会话依赖它跨轮连续）
         interview_mode: 是否开启模拟面试模式
+        resume_summary: 简历结构化摘要（定向面试用，无则按通识面试）
+        jd_text: 目标岗位 JD 全文（定向面试用，无则按通识面试）
 
     Returns:
         包含 final_response 的状态字典
@@ -238,6 +242,8 @@ def run_workflow(
         "user_id": user_id,
         "current_message": message,
         "interview_mode": interview_mode,
+        "resume_summary": resume_summary or "",
+        "jd_text": jd_text or "",
     }
     # 面试模式关闭时重置会话：避免 checkpoint 中旧 session 残留，
     # 导致用户重开面试时把关闭期间的闲聊误当作上一题的回答评估

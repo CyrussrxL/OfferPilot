@@ -48,6 +48,8 @@ class State(TypedDict, total=False):
         probe_count 等字段，由 interview_evaluate/interview_ask 节点维护
       interview_response: 面试官节点的本轮输出（追问/新题/反馈），由面试图节点产出
       interview_report: 面试结束生成的结构化报告（维度评分/薄弱点/学习建议）
+      resume_summary: 简历结构化摘要（定向面试用，来自 user_profile.resume_summary）
+      jd_text: 目标岗位 JD 全文（定向面试用，当次会话传入）
       daily_report: 日报内容
       user_behavior: 用户行为特征（输入频率、消息长度、时间段等），由 GuardAgent 分析
       classification_confidence: 分类置信度 (0.0~1.0)，由 GuardAgent 计算
@@ -74,6 +76,9 @@ class State(TypedDict, total=False):
     interview_session: Dict[str, Any]
     interview_response: str
     interview_report: Dict[str, Any]
+    # 定向面试上下文（简历摘要 / JD 全文，由前端传入，无则按通识面试）
+    resume_summary: str
+    jd_text: str
     daily_report: str
     user_behavior: Dict[str, Any]
     classification_confidence: float

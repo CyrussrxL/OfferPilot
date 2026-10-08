@@ -36,6 +36,7 @@ from langchain_openai import ChatOpenAI
 from companion_ai.graph.state import State
 from companion_ai.memory.vector_store import vector_store
 from companion_ai.tools.career_tools import get_interview_questions
+from companion_ai.tools.resume_parser import build_resume_brief
 from companion_ai.utils.config import settings
 from companion_ai.utils.helpers import format_user_profile, get_timestamp, safe_json_loads
 from companion_ai.utils.logger import logger
@@ -82,9 +83,14 @@ def _parse_json(content: str) -> Dict[str, Any]:
         return {}
 
 
-def _infer_interview_topic(profile: Dict[str, Any], message: str) -> str:
-    """从用户画像和首条消息推断面试主题（映射到题库主题）。"""
-    text = f"{profile.get('job_target', '')} {profile.get('learning_goal', '')} {message}"
+def _infer_interview_topic(
+    profile: Dict[str, Any], message: str, jd_text: str = ""
+) -> str:
+    """从用户画像、首条消息和 JD 推断面试主题（映射到题库主题）。
+
+    JD 优先级最高：有 JD 时主要从 JD 关键词推断主题（岗位描述天然带方向）。
+    """
+    text = f"{profile.get('job_target', '')} {profile.get('learning_goal', '')} {message} {jd_text}"
     topic_map = {
         "AI": ["ai", "算法工程师", "机器学习", "深度学习", "nlp", "大模型", "llm"],
         "算法": ["算法", "数据结构", "刷题", "leetcode"],
@@ -99,17 +105,28 @@ def _infer_interview_topic(profile: Dict[str, Any], message: str) -> str:
     return "AI"
 
 
-def _new_session(profile: Dict[str, Any], message: str) -> Dict[str, Any]:
-    """创建一场新的面试会话状态。"""
+def _new_session(
+    profile: Dict[str, Any],
+    message: str,
+    resume_summary: str = "",
+    jd_text: str = "",
+) -> Dict[str, Any]:
+    """创建一场新的面试会话状态。
+
+    resume_summary / jd_text 为定向面试上下文：有则出题/追问/评估全程注入，
+    无则按通识面试（向后兼容）。
+    """
     return {
         "active": True,
-        "topic": _infer_interview_topic(profile, message),
+        "topic": _infer_interview_topic(profile, message, jd_text),
         "questions": [],       # [{"question", "dimension", "answer", "evaluation"}]
         "asked_count": 0,
         "max_questions": settings.INTERVIEW_MAX_QUESTIONS,
         "probe_count": 0,      # 当前题已追问次数（每题最多 1 次）
         "awaiting_answer": False,
         "started_at": get_timestamp(),
+        "resume_summary": resume_summary,  # 简历结构化摘要（定向出题用）
+        "jd_text": jd_text,              # 目标岗位 JD 全文（定向考察用）
     }
 
 
@@ -133,13 +150,17 @@ def interview_evaluate(state: State) -> Dict:
     message = state.get("current_message", "")
     profile = state.get("user_profile", {})
     session = state.get("interview_session") or {}
+    # 定向面试上下文（前端传入；无则空串，按通识面试）
+    resume_summary = state.get("resume_summary", "") or ""
+    jd_text = state.get("jd_text", "") or ""
 
-    # 1. 无活跃会话 → 开启新面试
+    # 1. 无活跃会话 → 开启新面试（注入简历/JD 上下文）
     if not session.get("active"):
-        session = _new_session(profile, message)
+        session = _new_session(profile, message, resume_summary, jd_text)
         session["decision"] = "ask"
+        directed = "定向" if (resume_summary or jd_text) else "通识"
         logger.info(
-            f"InterviewEvaluate | user={user_id} | 开启新面试 topic={session['topic']}"
+            f"InterviewEvaluate | user={user_id} | 开启新面试 topic={session['topic']} | {directed}"
         )
         return {"interview_session": session}
 
@@ -157,11 +178,16 @@ def interview_evaluate(state: State) -> Dict:
 
     # 4. 评估用户对当前题目的回答
     current_q = session["questions"][-1] if session["questions"] else {}
+    jd_hint = (
+        f"\n目标岗位 JD 摘要（评估时对照岗位要求，含岗位匹配度维度）：\n{session.get('jd_text', '')[:600]}"
+        if session.get("jd_text")
+        else ""
+    )
     prompt = f"""你是一位资深的技术面试官，正在评估候选人对面试题的回答。
 
 面试主题：{session.get("topic", "AI")}
 面试题目：{current_q.get("question", "")}
-考察维度：{current_q.get("dimension", "综合能力")}
+考察维度：{current_q.get("dimension", "综合能力")}{jd_hint}
 
 候选人回答：
 「{message}」
@@ -237,6 +263,8 @@ def interview_ask(state: State) -> Dict:
         # 动态追问：基于薄弱点深挖
         current_q = session["questions"][-1] if session["questions"] else {}
         evaluation = current_q.get("evaluation", {})
+        # resume_summary 已是构建好的摘要字符串，直接注入
+        resume_hint = session.get("resume_summary", "")
 
         prompt = f"""你是一位资深的技术面试官。候选人刚刚的回答暴露了一些薄弱点，
 请基于薄弱点进行一次针对性追问，深挖候选人的理解深度。
@@ -244,6 +272,7 @@ def interview_ask(state: State) -> Dict:
 面试题目：{current_q.get("question", "")}
 候选人回答：{current_q.get("answer", "")}
 薄弱点：{", ".join(evaluation.get("weaknesses", []))}
+{f"候选人简历要点（可针对其中项目细节追问）：{chr(10)}{resume_hint}" if resume_hint else ""}
 
 要求：
 - 追问要具体、直接指向薄弱点，不要泛泛而谈
@@ -281,20 +310,38 @@ def interview_ask(state: State) -> Dict:
     fresh = [q for q in bank_questions if q not in asked]
 
     q_num = session.get("asked_count", 0) + 1
+    # 定向面试上下文（有简历/JD 时优先围绕简历项目深挖 + JD 技能考察）
+    resume_hint = session.get("resume_summary", "")
+    jd_hint = session.get("jd_text", "")
+    directed_block = ""
+    if resume_hint or jd_hint:
+        directed_block = "\n【定向面试模式】\n"
+        if resume_hint:
+            directed_block += (
+                f"候选人简历要点（出题优先围绕其中的项目经历深挖）：\n{resume_hint}\n\n"
+            )
+        if jd_hint:
+            directed_block += (
+                f"目标岗位 JD（出题优先考察 JD 中的核心技能与职责）：\n{jd_hint[:600]}\n\n"
+            )
+        directed_block += (
+            "出题策略：优先从简历项目经历和 JD 技能要求中找考察点，"
+            "让题目贴合候选人真实背景与目标岗位；题库仅作兜底参考。\n"
+        )
+
     prompt = f"""你是一位资深的技术面试官，正在对候选人进行「{topic}」方向的模拟面试，
 现在是第 {q_num} / {session.get("max_questions", 3)} 题。
 
 候选人画像：
-{profile_text}
-
-题库候选题目（可参考，也可基于画像改编得更贴合候选人背景）：
+{profile_text}{directed_block}
+题库候选题目（兜底参考，定向模式下优先自创贴合题）：
 {chr(10).join(f'- {q}' for q in fresh) if fresh else '（题库不可用，请自行出一道贴合画像的题）'}
 
 之前的面试题（不要重复）：
 {chr(10).join(f'- {q}' for q in asked) if asked else '（无）'}
 
 要求：
-- 出一道题，可参考题库并结合候选人画像改编
+- 出一道题，定向模式优先结合简历项目经历和 JD 技能要求，通识模式参考题库改编
 - 指定一个考察维度（如：基础知识 / 项目深度 / 表达能力 / 岗位匹配 / 系统设计）
 - 开头简短承接上一轮（如"好的，下一题"），面试官口吻
 
@@ -380,12 +427,26 @@ def interview_report(state: State) -> Dict:
         q.get("evaluation", {}).get("score", 0) for q in questions
     ) / len(questions)
 
+    # 定向面试：注入简历与 JD，报告增加岗位匹配度分析
+    resume_hint = session.get("resume_summary", "")
+    jd_hint = session.get("jd_text", "")
+    directed_context = ""
+    directed_report_section = ""
+    if resume_hint or jd_hint:
+        directed_context = "\n【定向面试上下文】\n"
+        if resume_hint:
+            directed_context += f"候选人简历要点：\n{resume_hint}\n\n"
+        if jd_hint:
+            directed_context += f"目标岗位 JD：\n{jd_hint[:600]}\n\n"
+        directed_report_section = (
+            "\n6. 岗位匹配度分析（结合 JD 要求与简历项目，指出匹配与差距）"
+        )
+
     prompt = f"""你是一位资深的技术面试官，刚结束一场「{session.get("topic", "AI")}」方向的模拟面试。
 请基于以下完整面试记录，生成一份结构化面试报告。
 
 候选人画像：
-{format_user_profile(profile)}
-
+{format_user_profile(profile)}{directed_context}
 面试记录：
 {qa_text}
 
@@ -394,7 +455,7 @@ def interview_report(state: State) -> Dict:
 2. 各题得分一览（表格：题号/维度/得分/一句话点评）
 3. 核心优势（列表）
 4. 薄弱点清单（列表，具体到知识点）
-5. 针对性学习建议（结合薄弱点，给出可执行的行动项）
+5. 针对性学习建议（结合薄弱点，给出可执行的行动项）{directed_report_section}
 
 语气：专业、建设性，像真实面试后的复盘反馈。"""
 

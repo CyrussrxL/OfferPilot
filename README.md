@@ -11,11 +11,11 @@
 - **混合意图处理**: 单条消息中的多个需求不再丢失——分类同时输出主/次意图（强意图词单次命中 + 弱词双次确认的轻量检测，零额外 LLM 成本），主意图走专业路由，次意图由回复合成器追加回应段
 - **向量记忆 + 事实提取 + 反思**: episode/fact 双路召回，三因子加权（相似度 × 时间衰减 × 频率，事实加成），每轮抽取结构化用户事实，周期性画像反思（对齐 Generative Agents）
 - **自建 MCP Tool Server**: 基于 MCP 官方 SDK（FastMCP + stdio）将代码沙箱、简历评分、面试题库、岗位要求封装为标准 MCP 工具服务，Agent 经 Function Calling 真实调用，不可用时自动降级本地实现
-- **循环面试对话状态机**: 动态出题 → 评估回答 → 薄弱点追问（条件回边）→ 结构化面试报告，报告薄弱点回流长期记忆；前端独立面试视图，切入自动开场、切走自动收尾出报告
+- **循环面试对话状态机**: 动态出题 → 评估回答 → 薄弱点追问（条件回边）→ 结构化面试报告，报告薄弱点回流长期记忆；支持**简历+JD 定向面试**（上传简历/粘贴 JD 后出题围绕简历项目深挖、评估对照岗位要求、报告含岗位匹配度分析，简历摘要经 LLM 一次解析入画像长期复用），无简历/JD 时按画像通识面试；前端独立面试视图，切入自动开场、切走自动收尾出报告
 - **会话持久化与记忆容量治理**: LangGraph 检查点经 SqliteSaver 落盘，面试会话跨进程重启可恢复；episode 记忆有界保留（超 200 条按时间戳删至最近 100，fact 永不删），AI 回复截断入库控制存储与检索噪音
 - **JD 驱动技能 Gap 分析**: 岗位技能要求知识库与用户画像/事实记忆对比，输出三档 Gap 矩阵与学习路径，学习进展回流形成闭环
 - **用户可控记忆面板**: 前端查看/纠正/删除 AI 提取的事实记忆，消除记忆黑盒（配套 RESTful API）
-- **情绪关怀**: 多语言情感模型（中英统一三分类，低置信中性兜底）+ 置信度/效价双分数语义——分级关怀按强度分层（9 级 + 模板轮换），情绪趋势按效价判定（连续低落 / 持续低迷触发深度关怀）
+- **情绪关怀**: 情感模型用户自选（HuggingFace 文本分类模型，多语言三分类可中英统一，低置信中性兜底）+ 置信度/效价双分数语义——分级关怀按强度分层（9 级 + 模板轮换），情绪趋势按效价判定（连续低落 / 持续低迷触发深度关怀）
 - **离线评测体系**: 分类评测集 / 记忆召回 ground truth / 节点级延迟与 token 剖析，指标可复现
 - **前后端分离**: FastAPI 后端 + Streamlit 前端（对话 / 模拟面试 / 记忆管理三视图，输入框常驻消息底部，对话按「用户ID_时间_首句话」自动命名）
 
@@ -51,7 +51,8 @@ Python | LangGraph | LangChain | ChromaDB | 通义千问（DashScope 兼容模�
        ↓              ↓               ↓         ↓
   Interview状态机  CodingAgent    CareerAgent  GeneralChat
   （循环面试图,    （MCP 沙箱）  （3 个 MCP 工具）
-   SqliteSaver）
+   SqliteSaver,
+   简历+JD 定向）
        │ evaluate → ask(追问/新题) / report（条件回边）
        └────┬──────────┬───────────┬─────────┘
             ↓
@@ -101,7 +102,9 @@ MCP_STDIO_SERVER_CMD=python -m companion_ai.tools.mcp_server
 # 检查点持久化（面试会话跨进程重启恢复，可选，默认 ./checkpoints.db）
 CHECKPOINT_DB_PATH=./checkpoints.db
 
-# 情感分析（多语言三分类模型，中英统一无需语言检测；false 时走关键词回退）
+# 情感分析（模型自选：任意 HuggingFace 文本分类模型，需输出 positive/negative(/neutral) 标签；
+# 示例为多语言三分类模型，中英统一；留空或设 false 时走关键词回退）
+SENTIMENT_MODEL_NAME=lxyuan/distilbert-base-multilingual-cased-sentiments-student
 SENTIMENT_FALLBACK_ENABLED=true
 ```
 
@@ -124,7 +127,7 @@ python start_all.py
 - **后端 API**: http://localhost:8000
 - **API 文档**: http://localhost:8000/docs (Swagger)
 
-主要 API：`POST /api/chat`、`GET /api/daily-report/{user_id}`、`POST /api/classification/correction`（错分纠错闭环）、`GET/DELETE/PUT /api/memory/facts/{user_id}`（用户可控记忆）
+主要 API：`POST /api/chat`、`POST /api/resume/upload`、`POST /api/resume/text`（简历解析，PDF/MD/TXT）、`GET /api/daily-report/{user_id}`、`POST /api/classification/correction`（错分纠错闭环）、`GET/DELETE/PUT /api/memory/facts/{user_id}`（用户可控记忆）
 
 ## 📁 项目结构
 
@@ -136,11 +139,11 @@ OfferPilot/
 │   │   ├── memory_agent.py      # 双路召回 + 事实提取 + 画像反思
 │   │   ├── coding_agent.py      # 编程辅导（Function Calling 绑定沙箱工具）
 │   │   ├── career_agent.py      # 求职辅导（3 个 MCP 工具 + Gap 分析）
-│   │   ├── interview_agent.py   # 循环面试状态机（evaluate/ask/report）
+│   │   ├── interview_agent.py   # 循环面试状态机（evaluate/ask/report，简历+JD 定向注入）
 │   │   └── response_composer.py # 情绪关怀统一收口 + 通用对话 + 日报
 │   ├── graph/                   # LangGraph 定义（图单例 + 检查点）
 │   ├── memory/                  # vector_store（ChromaDB）+ memory_reflection
-│   ├── tools/                   # mcp_server / mcp_stdio_client / career_tools / python_executor 等
+│   ├── tools/                   # mcp_server / mcp_stdio_client / career_tools / resume_parser / python_executor 等
 │   ├── data/                    # 分类种子 + 岗位技能要求知识库
 │   ├── backend/                 # FastAPI（对话/日报/纠错/记忆管理 API）
 │   ├── frontend/                # Streamlit（对话 / 模拟面试 / 记忆管理三视图）
@@ -183,6 +186,8 @@ OfferPilot/
 
 带条件回边的多轮面试图：题目经 MCP 题库获取并结合画像定制，评估回答后按得分决策"薄弱点动态追问 / 下一题 / 生成报告"，会话状态经 LangGraph 检查点（SqliteSaver 落盘）持久化，跨轮对话与进程重启均可无缝续接；报告薄弱点写入事实记忆，后续辅导与检索自动感知用户短板。
 
+**简历+JD 定向面试**：用户上传简历（PDF/MD/TXT，pypdf 提取）或粘贴文本，LLM 一次解析为结构化摘要（项目经历/技能/亮点）存入画像长期复用；配合粘贴目标岗位 JD，出题优先围绕简历项目深挖与 JD 技能考察，评估对照岗位要求打分，报告追加岗位匹配度分析——无定向信息时自动回退画像通识面试，全链路向后兼容。
+
 前端为独立面试视图：切入自动开启面试（方向按用户画像定制，进度条实时显示已问题数与当前题目），切走自动经"结束面试"路径收尾生成报告并记录到画像 `job_progress.interview_reports`，历场面试表现可在记忆管理页回看——面试从"开关 + 手动结束"升级为随视图切换的完整生命周期管理。
 
 ### 5. JD 驱动的技能 Gap 闭环
@@ -197,7 +202,7 @@ AI 提取的事实可能有错误或过时——记忆管理面板支持查看�
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest                    # 全量测试 + 覆盖率报告（227 个测试，全 mock 零外部调用）
+pytest                    # 全量测试 + 覆盖率报告（241 个测试，全 mock 零外部调用）
 pytest -m "not slow"     # 跳过慢速测试
 pytest tests/unit         # 仅单元测试
 ```
