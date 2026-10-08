@@ -10,6 +10,8 @@ OfferPilot 测试公共配置。
                              本地 SimpleEmbeddingFunction 分支（零远程调用）
   - MCP_ENABLED=false      → @tool 层直接走本地降级实现（不拉起 MCP 子进程）
   - CHECKPOINT_DB_PATH     → 临时路径（隔离真实 ./checkpoints.db）
+  - SENTIMENT_FALLBACK_ENABLED=false → 情感分析走关键词方案（不加载模型，
+                             免受本地 .env 开启模型的影响，保证零网络依赖）
 """
 
 import os
@@ -24,6 +26,7 @@ os.environ["EMBEDDING_API_KEY"] = "your_embedding_api_key_here"  # 占位值 →
 os.environ["MCP_ENABLED"] = "false"
 os.environ["CAREER_MCP_ENABLED"] = "false"
 os.environ["CHECKPOINT_DB_PATH"] = os.path.join(_TEST_TMP_DIR, "checkpoints.db")
+os.environ["SENTIMENT_FALLBACK_ENABLED"] = "false"
 
 import pytest  # noqa: E402
 

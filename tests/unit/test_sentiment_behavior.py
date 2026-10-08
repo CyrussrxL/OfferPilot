@@ -1,7 +1,8 @@
-"""情感分析（关键词方案）与行为分析器单元测试。
+"""情感分析（关键词回退 + 模型路由）与行为分析器单元测试。
 
 测试环境 SENTIMENT_FALLBACK_ENABLED=False（默认），sentiment_analyzer
-单例直接走关键词方案，无模型加载、零网络调用。
+单例直接走关键词方案，无模型加载、零网络调用；模型路由测试通过
+monkeypatch 注入假 pipeline，同样零网络依赖。
 """
 
 from datetime import datetime
@@ -44,6 +45,124 @@ class TestSentimentKeywords:
         # 正负命中数相同 → neutral（"好累"负面 vs "太好了"正面）
         label, score = sentiment_analyzer_analyze("好累，但是太好了")
         assert (label, score) == ("neutral", 0.5)
+
+
+def _patch_pipeline(monkeypatch, results=None, side_effect=None):
+    """注入假 pipeline 并启用模型路径（monkeypatch 自动还原单例状态）。"""
+    from companion_ai.emotion.sentiment_analyzer import sentiment_analyzer
+
+    def fake_pipeline(text):
+        if side_effect:
+            raise side_effect
+        return results
+
+    monkeypatch.setattr(sentiment_analyzer, "use_fallback", False)
+    monkeypatch.setattr(sentiment_analyzer, "pipeline", fake_pipeline)
+
+
+class TestModelRouting:
+    """模型可用时的统一路由：中英文均走模型，不再按语言分流。"""
+
+    def test_chinese_uses_model_when_available(self, monkeypatch):
+        _patch_pipeline(
+            monkeypatch, results=[{"label": "negative", "score": 0.93}]
+        )
+        label, score = sentiment_analyzer_analyze("最近好焦虑，压力太大了")
+        assert (label, score) == ("negative", 0.93)
+
+    def test_english_uses_model(self, monkeypatch):
+        _patch_pipeline(
+            monkeypatch, results=[{"label": "positive", "score": 0.88}]
+        )
+        label, score = sentiment_analyzer_analyze("I got the offer, so happy!")
+        assert (label, score) == ("positive", 0.88)
+
+    def test_model_neutral_label_maps_to_half_score(self, monkeypatch):
+        # 多语言模型的 neutral 是真实类别；分数统一为 0.5（与关键词方案一致）
+        _patch_pipeline(
+            monkeypatch, results=[{"label": "neutral", "score": 0.71}]
+        )
+        label, score = sentiment_analyzer_analyze("今天下午三点开会")
+        assert (label, score) == ("neutral", 0.5)
+
+    def test_model_label_case_insensitive(self, monkeypatch):
+        _patch_pipeline(
+            monkeypatch, results=[{"label": "POSITIVE", "score": 0.8}]
+        )
+        assert sentiment_analyzer_analyze("Great progress") == ("positive", 0.8)
+
+    def test_model_low_confidence_maps_to_neutral(self, monkeypatch):
+        # 三分类下 top-1 置信度 < 0.5（模型不确定）→ 中性兜底
+        _patch_pipeline(
+            monkeypatch, results=[{"label": "positive", "score": 0.4348}]
+        )
+        assert sentiment_analyzer_analyze("今天下午三点开会") == ("neutral", 0.5)
+
+    def test_model_exception_falls_back_to_keywords(self, monkeypatch):
+        _patch_pipeline(monkeypatch, side_effect=RuntimeError("model down"))
+        label, score = sentiment_analyzer_analyze("最近好焦虑，压力太大了")
+        assert label == "negative"
+        assert score > 0.5
+
+
+def _analyze_full(text):
+    from companion_ai.emotion.sentiment_analyzer import sentiment_analyzer
+    return sentiment_analyzer.analyze_full(text)
+
+
+class TestValence:
+    """效价（valence）计算：与置信度（score）语义分离。
+
+    趋势的深度关怀通道（连续 3 次 < 0.4 / 5 次均值 < 0.45）按效价语义
+    设计，负面样本的效价必须 < 0.4 才能触发。
+    """
+
+    def test_derive_valence_direct(self):
+        from companion_ai.emotion.sentiment_analyzer import derive_valence
+
+        assert derive_valence("positive", 0.8) == 0.8
+        assert derive_valence("negative", 0.8) == 0.2
+        assert derive_valence("neutral", 0.5) == 0.5
+
+    def test_keyword_negative_valence_inverted(self):
+        # 负面置信度越高 → 效价越低（1 - score），入趋势后可达 < 0.4
+        label, score, valence = _analyze_full("最近好焦虑，压力太大了")
+        assert label == "negative"
+        assert valence == round(1 - score, 4)
+        assert valence < 0.4
+
+    def test_keyword_positive_valence_kept(self):
+        label, score, valence = _analyze_full("今天面试过了，太开心了，感谢")
+        assert label == "positive"
+        assert valence == score
+
+    def test_keyword_neutral_valence_half(self):
+        assert _analyze_full("今天下午三点开会") == ("neutral", 0.5, 0.5)
+
+    def test_empty_text_valence_half(self):
+        assert _analyze_full("") == ("neutral", 0.5, 0.5)
+
+    def test_model_full_distribution_valence(self, monkeypatch):
+        # 完整分布：效价 = P(positive) + 0.5 × P(neutral) = 0.6 + 0.15
+        from companion_ai.emotion.sentiment_analyzer import sentiment_analyzer
+
+        def fake_pipeline(text, top_k=None):
+            return [
+                {"label": "positive", "score": 0.6},
+                {"label": "neutral", "score": 0.3},
+                {"label": "negative", "score": 0.1},
+            ]
+
+        monkeypatch.setattr(sentiment_analyzer, "use_fallback", False)
+        monkeypatch.setattr(sentiment_analyzer, "pipeline", fake_pipeline)
+        assert _analyze_full("今天状态不错") == ("positive", 0.6, 0.75)
+
+    def test_model_single_result_valence_derived(self, monkeypatch):
+        # pipeline 不支持 top_k 时退化为单结果 + derive_valence 近似
+        _patch_pipeline(
+            monkeypatch, results=[{"label": "negative", "score": 0.93}]
+        )
+        assert _analyze_full("最近好焦虑") == ("negative", 0.93, 0.07)
 
 
 class TestContainsCode:

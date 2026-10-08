@@ -20,6 +20,7 @@ MemoryAgent —— 记忆 Agent
 
 from typing import Dict
 
+from companion_ai.emotion.sentiment_analyzer import derive_valence
 from companion_ai.graph.state import State
 from companion_ai.memory.memory_reflection import extract_facts, reflect_on_profile
 from companion_ai.memory.vector_store import vector_store
@@ -52,6 +53,11 @@ def memory_agent(state: State) -> Dict:
     message = state.get("current_message", "")
     emotion_label = state.get("emotion_label", "neutral")
     emotion_score = state.get("emotion_score", 0.5)
+    # 情绪效价（0=负面, 0.5=中性, 1=正面）：趋势与主动记忆检索均按效价
+    # 语义设计；旧状态无此字段（如历史检查点恢复）时由 label/score 推导
+    emotion_valence = state.get("emotion_valence")
+    if emotion_valence is None:
+        emotion_valence = derive_valence(emotion_label, emotion_score)
     message_category = state.get("message_category", "chitchat")
 
     # 1a. 事实记忆召回（高权重、信息密度高）
@@ -72,11 +78,11 @@ def memory_agent(state: State) -> Dict:
     # 合并双路结果：事实在前（权重加成后通常得分更高）
     retrieved_memories = fact_memories + episode_memories
 
-    # 2. 主动记忆检索（根据情绪状态推送相关记忆）
+    # 2. 主动记忆检索（根据情绪状态推送相关记忆，效价语义）
     proactive_memories = vector_store.proactive_memory_retrieval(
         user_id=user_id,
         current_emotion=emotion_label,
-        emotion_score=emotion_score,
+        emotion_score=emotion_valence,
         top_k=2,
     )
 
@@ -100,16 +106,18 @@ def memory_agent(state: State) -> Dict:
 
     # 6. 更新对话计数（先保存，避免覆盖下一步写入的情绪趋势：
     #    user_profile 是本轮开头取的快照，若在 update_emotional_trend
-    #    之后保存，会把刚追加的 emotion_score 抹掉）
+    #    之后保存，会把刚追加的情绪效价抹掉）
     conversation_count = user_profile.get("conversation_count", 0) + 1
     user_profile["conversation_count"] = conversation_count
     vector_store.save_user_profile(user_id, user_profile)
 
-    # 7. 更新情绪趋势（内部重新读取最新画像后追加落库；同时同步回本地
-    #    快照——下游节点（如 CareerAgent）会用 state 中的画像回写存储，
-    #    若快照缺最新趋势，回写时会把趋势覆盖掉）
+    # 7. 更新情绪趋势（效价语义：0=负面, 0.5=中性, 1=正面；置信度直接
+    #    入趋势会让负面样本永远 ≥0.55，趋势通道的深度关怀永不触发）。
+    #    内部重新读取最新画像后追加落库；同时同步回本地快照——下游节点
+    #    （如 CareerAgent）会用 state 中的画像回写存储，若快照缺最新趋势，
+    #    回写时会把趋势覆盖掉
     user_profile["emotional_trend"] = vector_store.update_emotional_trend(
-        user_id, emotion_score
+        user_id, emotion_valence
     )
 
     # 8. 记忆容量治理（每 10 次对话检查一次）

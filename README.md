@@ -15,7 +15,7 @@
 - **会话持久化与记忆容量治理**: LangGraph 检查点经 SqliteSaver 落盘，面试会话跨进程重启可恢复；episode 记忆有界保留（超 200 条按时间戳删至最近 100，fact 永不删），AI 回复截断入库控制存储与检索噪音
 - **JD 驱动技能 Gap 分析**: 岗位技能要求知识库与用户画像/事实记忆对比，输出三档 Gap 矩阵与学习路径，学习进展回流形成闭环
 - **用户可控记忆面板**: 前端查看/纠正/删除 AI 提取的事实记忆，消除记忆黑盒（配套 RESTful API）
-- **情绪关怀**: 基于历史情绪趋势的分级关怀机制，连续低落触发深度关怀
+- **情绪关怀**: 多语言情感模型（中英统一三分类，低置信中性兜底）+ 置信度/效价双分数语义——分级关怀按强度分层（9 级 + 模板轮换），情绪趋势按效价判定（连续低落 / 持续低迷触发深度关怀）
 - **离线评测体系**: 分类评测集 / 记忆召回 ground truth / 节点级延迟与 token 剖析，指标可复现
 - **前后端分离**: FastAPI 后端 + Streamlit 前端（对话 / 模拟面试 / 记忆管理三视图，输入框常驻消息底部，对话按「用户ID_时间_首句话」自动命名）
 
@@ -38,7 +38,7 @@ Python | LangGraph | LangChain | ChromaDB | 通义千问（DashScope 兼容模�
 
 ```
 用户消息 → GuardAgent
-             ├─ 情感分析（规则引擎 / 可选模型）
+             ├─ 情感分析（多语言模型 / 关键词回退，置信度 + 效价双分数）
              ├─ 三层分类: 代码正则 → 向量相似度 → LLM 仲裁 → 关键词兜底
              ├─ 次意图检测（强/弱关键词，混合意图双路响应）
              └─ 行为分析（输入频率、消息长度、时间段）
@@ -56,7 +56,7 @@ Python | LangGraph | LangChain | ChromaDB | 通义千问（DashScope 兼容模�
        └────┬──────────┬───────────┬─────────┘
             ↓
     ResponseComposer
-       ├─ 情绪关怀（基于历史趋势分级，统一收口）
+       ├─ 情绪关怀（按效价趋势分级，统一收口）
        ├─ 拼接专业回复
        └─ 存储记忆
             ↓
@@ -100,6 +100,9 @@ MCP_STDIO_SERVER_CMD=python -m companion_ai.tools.mcp_server
 
 # 检查点持久化（面试会话跨进程重启恢复，可选，默认 ./checkpoints.db）
 CHECKPOINT_DB_PATH=./checkpoints.db
+
+# 情感分析（多语言三分类模型，中英统一无需语言检测；false 时走关键词回退）
+SENTIMENT_FALLBACK_ENABLED=true
 ```
 
 ### 3. 启动项目
@@ -194,7 +197,7 @@ AI 提取的事实可能有错误或过时——记忆管理面板支持查看�
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest                    # 全量测试 + 覆盖率报告（208 个测试，全 mock 零外部调用）
+pytest                    # 全量测试 + 覆盖率报告（227 个测试，全 mock 零外部调用）
 pytest -m "not slow"     # 跳过慢速测试
 pytest tests/unit         # 仅单元测试
 ```

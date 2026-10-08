@@ -27,7 +27,9 @@ class State(TypedDict, total=False):
       user_id: 用户唯一标识，用于记忆检索和画像管理
       current_message: 用户当前输入的消息
       emotion_label: 情感标签 (positive/negative/neutral)，由 GuardAgent 产出
-      emotion_score: 情感分数 (0.0~1.0)，由 GuardAgent 产出
+      emotion_score: 情感分数 (0.0~1.0)，标签置信度/强度语义，由 GuardAgent 产出
+      emotion_valence: 情绪效价 (0.0=负面, 0.5=中性, 1.0=正面)，供情绪趋势
+        等按效价语义设计的消费方使用，由 GuardAgent 产出
       message_category: 消息类别 (coding/career/emotional/chitchat)，由 GuardAgent 产出
       secondary_category: 次要意图类别（主类别之外明确存在的另一意图，如"情绪+求职"
         混合消息中的情绪意图），无次意图时为空字符串，由 GuardAgent 产出
@@ -56,6 +58,7 @@ class State(TypedDict, total=False):
     current_message: str
     emotion_label: str
     emotion_score: float
+    emotion_valence: float
     message_category: str
     secondary_category: str
     retrieved_memories: List[Dict[str, Any]]

@@ -421,8 +421,10 @@ def guard_agent(state: State) -> Dict:
     # 1. 分析行为特征（多模态分类）
     behavior = behavior_analyzer.analyze_behavior(user_id, message)
 
-    # 2. 情感分析
-    emotion_label, emotion_score = sentiment_analyzer.analyze(message)
+    # 2. 情感分析（score=置信度/强度，供分级关怀；valence=效价，供情绪趋势）
+    emotion_label, emotion_score, emotion_valence = (
+        sentiment_analyzer.analyze_full(message)
+    )
 
     # 3. 消息分类（置信度分级：高置信直出 / 低置信 LLM 仲裁）
     message_category, classification_confidence, arbitration_used = (
@@ -446,7 +448,7 @@ def guard_agent(state: State) -> Dict:
 
     logger.info(
         f"GuardAgent | user={user_id} | "
-        f"emotion={emotion_label}({emotion_score:.2f}) | "
+        f"emotion={emotion_label}({emotion_score:.2f}, valence={emotion_valence:.2f}) | "
         f"category={message_category} (confidence={classification_confidence:.2f}, "
         f"arbitration={arbitration_used}) | "
         f"secondary={secondary_category or '无'} | "
@@ -457,6 +459,7 @@ def guard_agent(state: State) -> Dict:
     return {
         "emotion_label": emotion_label,
         "emotion_score": emotion_score,
+        "emotion_valence": emotion_valence,
         "message_category": message_category,
         "secondary_category": secondary_category,
         "user_behavior": behavior,

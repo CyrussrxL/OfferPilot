@@ -5,11 +5,13 @@
   对用户输入文本进行情感分析，返回情感标签（positive/negative/neutral）和情感分数（0~1）。
 
 设计理由：
-  - 优先使用 transformers 的预训练模型 distilbert-base-uncased-finetuned-sst-2-english，
-    该模型在 SST-2 数据集上微调，对英文情感分类效果优秀。
-  - 由于用户输入可能为中文，模型对中文情感判断可能不够准确，
-    因此提供基于关键词的本地回退方案，确保系统在模型加载失败时仍能工作。
-  - 回退逻辑基于中英文情感关键词匹配，覆盖常见的情绪表达。
+  - 默认使用 lxyuan/distilbert-base-multilingual-cased-sentiments-student：
+    6 层 DistilBERT 多语言情感模型（中英等 12 种语言），由 mDeBERTa-v3
+    零样本教师蒸馏而来，直接输出 positive/neutral/negative 三分类，
+    中英文统一走同一模型，无需按语言分流。
+  - 提供基于关键词的本地回退方案：模型加载失败（网络问题、依赖缺失）
+    或 SENTIMENT_FALLBACK_ENABLED=False（快速启动）时兜底，
+    基于中英文情感关键词匹配，覆盖常见的情绪表达。
 """
 
 import os
@@ -18,6 +20,21 @@ from typing import Tuple
 
 from companion_ai.utils.config import settings
 from companion_ai.utils.logger import logger
+
+
+def derive_valence(label: str, score: float) -> float:
+    """
+    由 (label, score) 推导情绪效价（0=负面, 0.5=中性, 1=正面）。
+
+    score 语义是标签置信度/强度（negative 0.9 = 强负面），效价需要
+    反转负面方向：效价 = 1 - score。关键词回退路径、模型单结果退化
+    路径以及旧状态兼容（无 emotion_valence 的历史检查点）时使用。
+    """
+    if label == "positive":
+        return round(score, 4)
+    if label == "negative":
+        return round(1 - score, 4)
+    return 0.5
 
 
 class SentimentAnalyzer:
@@ -91,52 +108,94 @@ class SentimentAnalyzer:
         """
         分析文本情感，返回 (emotion_label, emotion_score)。
 
+        等价于 analyze_full(text) 的前两个返回值，保持既有调用方兼容。
+        """
+        label, score, _ = self.analyze_full(text)
+        return label, score
+
+    def analyze_full(self, text: str) -> Tuple[str, float, float]:
+        """
+        分析文本情感，返回 (emotion_label, emotion_score, emotion_valence)。
+
         逻辑：
-          - 对于中文文本，强制使用关键词回退方案（英文模型对中文识别效果差）
-          - 对于英文文本，使用模型分析
+          - 模型可用时，中英文统一走多语言模型（三分类，无需语言检测分流）
+          - 模型不可用（未启用 / 加载失败）时，回退关键词方案
 
-        Args:
-            text: 用户输入文本
-
-        Returns:
-            emotion_label: "positive" / "negative" / "neutral"
-            emotion_score: 0.0 ~ 1.0 的情感强度分数
+        两种分数的语义区分（重要）：
+          - emotion_score: 标签置信度/强度（negative 0.9 = 强负面），
+            供 ResponseComposer 分级关怀等按强度分层的逻辑使用
+          - emotion_valence: 情绪效价（0=负面, 0.5=中性, 1=正面），
+            供 MemoryAgent 情绪趋势使用——趋势的"连续 3 次 < 0.4 判负面/
+            5 次均值 < 0.45 判低迷"均以效价语义设计，置信度直接入趋势
+            会导致负面样本永远达不到 0.4 以下，深度关怀趋势通道失效
         """
         if not text or not text.strip():
-            return "neutral", 0.5
+            return "neutral", 0.5, 0.5
 
-        # 检测是否包含中文字符
-        has_chinese = any('\u4e00' <= char <= '\u9fff' for char in text)
-        
-        if has_chinese:
-            # 中文文本使用关键词回退方案
-            return self._analyze_with_keywords(text)
-        elif self.pipeline is not None and not self.use_fallback:
-            # 英文文本使用模型分析
+        if self.pipeline is not None and not self.use_fallback:
             return self._analyze_with_model(text)
-        else:
-            # 其他情况使用关键词方案
-            return self._analyze_with_keywords(text)
+        label, score = self._analyze_with_keywords(text)
+        return label, score, derive_valence(label, score)
 
-    def _analyze_with_model(self, text: str) -> Tuple[str, float]:
+    def _analyze_with_model(self, text: str) -> Tuple[str, float, float]:
         """
         使用 transformers pipeline 进行情感分析。
-        模型输出 POSITIVE/NEGATIVE 标签和对应置信度分数。
+
+        多语言模型输出 positive/neutral/negative 三分类。优先取完整分布：
+          - top-1 标签 + 置信度 → (label, score)
+          - 效价 = P(positive) + 0.5 × P(neutral)，充分利用三分类概率信息
+        若 pipeline 不支持 top_k（mock / 旧版 transformers），退化为单结果
+        + derive_valence 近似。top-1 置信度 < 0.5 视为不确定 → 中性兜底。
         """
         try:
-            result = self.pipeline(text)[0]
-            label = result["label"].lower()
-            score = round(result["score"], 4)
-
-            if label == "positive":
-                return "positive", score
-            elif label == "negative":
-                return "negative", score
+            dist = self._model_distribution(text)
+            if dist:
+                top_label = max(dist, key=dist.get)
+                score = round(dist[top_label], 4)
+                valence = round(
+                    dist.get("positive", 0.0) + 0.5 * dist.get("neutral", 0.0), 4
+                )
             else:
-                return "neutral", 0.5
+                result = self.pipeline(text)[0]
+                top_label = result["label"].lower()
+                score = round(result["score"], 4)
+                valence = None
+
+            # 三分类下 top-1 置信度 < 0.5 意味着模型不确定
+            # （如陈述句/疑问句被弱置信地判为 positive/negative）→ 中性兜底，
+            # 避免中性内容误触发情绪关怀
+            if score < 0.5:
+                return "neutral", 0.5, 0.5
+
+            if top_label == "positive":
+                return "positive", score, valence if valence is not None else score
+            elif top_label == "negative":
+                if valence is None:
+                    valence = round(1 - score, 4)
+                return "negative", score, valence
+            else:
+                return "neutral", 0.5, 0.5
         except Exception as e:
             logger.error(f"模型情感分析异常: {e}，回退到关键词方案")
-            return self._analyze_with_keywords(text)
+            label, score = self._analyze_with_keywords(text)
+            return label, score, derive_valence(label, score)
+
+    def _model_distribution(self, text: str):
+        """
+        获取三分类完整概率分布 {label: prob}。
+
+        pipeline 不接受 top_k 参数（mock / 旧版 transformers）时
+        抛 TypeError，此处返回 None 由调用方走单结果退化路径。
+        """
+        try:
+            results = self.pipeline(text, top_k=3)
+            if results and isinstance(results[0], list):
+                results = results[0]  # 某些版本对单输入返回嵌套列表
+            if not results or not isinstance(results, list):
+                return None
+            return {r["label"].lower(): float(r["score"]) for r in results}
+        except TypeError:
+            return None
 
     def _analyze_with_keywords(self, text: str) -> Tuple[str, float]:
         """
